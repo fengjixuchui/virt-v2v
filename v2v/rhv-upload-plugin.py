@@ -17,6 +17,7 @@
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 import builtins
+import functools
 import json
 import logging
 import socket
@@ -56,6 +57,326 @@ def debug(s):
     if params['verbose']:
         print(s, file=sys.stderr)
         sys.stderr.flush()
+
+def read_password():
+    """
+    Read the password from file.
+    """
+    with builtins.open(params['output_password'], 'r') as fp:
+        data = fp.read()
+    return data.rstrip()
+
+def parse_username():
+    """
+    Parse out the username from the output_conn URL.
+    """
+    parsed = urlparse(params['output_conn'])
+    return parsed.username or "admin@internal"
+
+def failing(func):
+    """
+    Decorator marking the handle as failed if any expection is raised in the
+    decorated function.  This is used in close() to cleanup properly after
+    failures.
+    """
+    @functools.wraps(func)
+    def wrapper(h, *args):
+        try:
+            return func(h, *args)
+        except:
+            h['failed'] = True
+            raise
+
+    return wrapper
+
+def open(readonly):
+    connection = sdk.Connection(
+        url = params['output_conn'],
+        username = parse_username(),
+        password = read_password(),
+        ca_file = params['rhv_cafile'],
+        log = logging.getLogger(),
+        insecure = params['insecure'],
+    )
+
+    # Use the local host is possible.
+    host = find_host(connection) if params['rhv_direct'] else None
+    disk = create_disk(connection)
+
+    transfer = create_transfer(connection, disk, host)
+    try:
+        destination_url = parse_transfer_url(transfer)
+        http = create_http(destination_url)
+        options = get_options(http, destination_url)
+        http = optimize_http(http, host, options)
+    except:
+        cancel_transfer(connection, transfer)
+        raise
+
+    debug("imageio features: flush=%(can_flush)r trim=%(can_trim)r "
+          "zero=%(can_zero)r unix_socket=%(unix_socket)r"
+          % options)
+
+    # Save everything we need to make requests in the handle.
+    return {
+        'can_flush': options['can_flush'],
+        'can_trim': options['can_trim'],
+        'can_zero': options['can_zero'],
+        'needs_auth': options['needs_auth'],
+        'connection': connection,
+        'disk_id': disk.id,
+        'transfer': transfer,
+        'failed': False,
+        'highestwrite': 0,
+        'http': http,
+        'path': destination_url.path,
+    }
+
+@failing
+def can_trim(h):
+    return h['can_trim']
+
+@failing
+def can_flush(h):
+    return h['can_flush']
+
+@failing
+def get_size(h):
+    return params['disk_size']
+
+# Any unexpected HTTP response status from the server will end up calling this
+# function which logs the full error, and raises a RuntimeError exception.
+def request_failed(r, msg):
+    status = r.status
+    reason = r.reason
+    try:
+        body = r.read()
+    except EnvironmentError as e:
+        body = "(Unable to read response body: %s)" % e
+
+    # Log the full error if we're verbose.
+    debug("unexpected response from imageio server:")
+    debug(msg)
+    debug("%d: %s" % (status, reason))
+    debug(body)
+
+    # Only a short error is included in the exception.
+    raise RuntimeError("%s: %d %s: %r" % (msg, status, reason, body[:200]))
+
+# For documentation see:
+# https://github.com/oVirt/ovirt-imageio/blob/master/docs/random-io.md
+# For examples of working code to read/write from the server, see:
+# https://github.com/oVirt/ovirt-imageio/blob/master/daemon/test/server_test.py
+
+@failing
+def pread(h, count, offset):
+    http = h['http']
+    transfer = h['transfer']
+
+    headers = {"Range": "bytes=%d-%d" % (offset, offset+count-1)}
+    if h['needs_auth']:
+        headers["Authorization"] = transfer.signed_ticket
+
+    http.request("GET", h['path'], headers=headers)
+
+    r = http.getresponse()
+    # 206 = HTTP Partial Content.
+    if r.status != 206:
+        request_failed(r,
+                       "could not read sector offset %d size %d" %
+                       (offset, count))
+
+    return r.read()
+
+@failing
+def pwrite(h, buf, offset):
+    http = h['http']
+    transfer = h['transfer']
+
+    count = len(buf)
+    h['highestwrite'] = max(h['highestwrite'], offset+count)
+
+    http.putrequest("PUT", h['path'] + "?flush=n")
+    if h['needs_auth']:
+        http.putheader("Authorization", transfer.signed_ticket)
+    # The oVirt server only uses the first part of the range, and the
+    # content-length.
+    http.putheader("Content-Range", "bytes %d-%d/*" % (offset, offset+count-1))
+    http.putheader("Content-Length", str(count))
+    http.endheaders()
+
+    try:
+        http.send(buf)
+    except BrokenPipeError:
+        pass
+
+    r = http.getresponse()
+    if r.status != 200:
+        request_failed(r,
+                       "could not write sector offset %d size %d" %
+                       (offset, count))
+
+    r.read()
+
+@failing
+def zero(h, count, offset, may_trim):
+    http = h['http']
+
+    # Unlike the trim and flush calls, there is no 'can_zero' method
+    # so nbdkit could call this even if the server doesn't support
+    # zeroing.  If this is the case we must emulate.
+    if not h['can_zero']:
+        emulate_zero(h, count, offset)
+        return
+
+    # Construct the JSON request for zeroing.
+    buf = json.dumps({'op': "zero",
+                      'offset': offset,
+                      'size': count,
+                      'flush': False}).encode()
+
+    headers = {"Content-Type": "application/json",
+               "Content-Length": str(len(buf))}
+
+    http.request("PATCH", h['path'], body=buf, headers=headers)
+
+    r = http.getresponse()
+    if r.status != 200:
+        request_failed(r,
+                       "could not zero sector offset %d size %d" %
+                       (offset, count))
+
+    r.read()
+
+def emulate_zero(h, count, offset):
+    http = h['http']
+    transfer = h['transfer']
+
+    # qemu-img convert starts by trying to zero/trim the whole device.
+    # Since we've just created a new disk it's safe to ignore these
+    # requests as long as they are smaller than the highest write seen.
+    # After that we must emulate them with writes.
+    if offset+count < h['highestwrite']:
+        http.putrequest("PUT", h['path'])
+        if h['needs_auth']:
+            http.putheader("Authorization", transfer.signed_ticket)
+        http.putheader("Content-Range",
+                       "bytes %d-%d/*" % (offset, offset+count-1))
+        http.putheader("Content-Length", str(count))
+        http.endheaders()
+
+        try:
+            buf = bytearray(128*1024)
+            while count > len(buf):
+                http.send(buf)
+                count -= len(buf)
+            http.send(memoryview(buf)[:count])
+        except BrokenPipeError:
+            pass
+
+        r = http.getresponse()
+        if r.status != 200:
+            request_failed(r,
+                           "could not write zeroes offset %d size %d" %
+                           (offset, count))
+
+        r.read()
+
+@failing
+def trim(h, count, offset):
+    http = h['http']
+
+    # Construct the JSON request for trimming.
+    buf = json.dumps({'op': "trim",
+                      'offset': offset,
+                      'size': count,
+                      'flush': False}).encode()
+
+    headers = {"Content-Type": "application/json",
+               "Content-Length": str(len(buf))}
+
+    http.request("PATCH", h['path'], body=buf, headers=headers)
+
+    r = http.getresponse()
+    if r.status != 200:
+        request_failed(r,
+                       "could not trim sector offset %d size %d" %
+                       (offset, count))
+
+    r.read()
+
+@failing
+def flush(h):
+    http = h['http']
+
+    # Construct the JSON request for flushing.
+    buf = json.dumps({'op': "flush"}).encode()
+
+    headers = {"Content-Type": "application/json",
+               "Content-Length": str(len(buf))}
+
+    http.request("PATCH", h['path'], body=buf, headers=headers)
+
+    r = http.getresponse()
+    if r.status != 200:
+        request_failed(r, "could not flush")
+
+    r.read()
+
+def close(h):
+    http = h['http']
+    connection = h['connection']
+    transfer = h['transfer']
+    disk_id = h['disk_id']
+
+    # This is sometimes necessary because python doesn't set up
+    # sys.stderr to be line buffered and so debug, errors or
+    # exceptions printed previously might not be emitted before the
+    # plugin exits.
+    sys.stderr.flush()
+
+    http.close()
+
+    # If the connection failed earlier ensure we cancel the trasfer. Canceling
+    # the transfer will delete the disk.
+    if h['failed']:
+        try:
+            cancel_transfer(connection, transfer)
+        finally:
+            connection.close()
+        return
+
+    # Try to finalize the transfer. On errors the transfer may be paused by the
+    # system, and we need to cancel the transfer to remove the disk.
+    try:
+        finalize_transfer(connection, transfer, disk_id)
+    except:
+        cancel_transfer(connection, transfer)
+        raise
+    else:
+        # Write the disk ID file.  Only do this on successful completion.
+        with builtins.open(params['diskid_file'], 'w') as fp:
+            fp.write(disk_id)
+    finally:
+        connection.close()
+
+# Modify http.client.HTTPConnection to work over a Unix domain socket.
+# Derived from uhttplib written by Erik van Zijst under an MIT license.
+# (https://pypi.org/project/uhttplib/)
+# Ported to Python 3 by Irit Goihman.
+
+class UnixHTTPConnection(HTTPConnection):
+    def __init__(self, path, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
+        self.path = path
+        HTTPConnection.__init__(self, "localhost", timeout=timeout)
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if self.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+            self.sock.settimeout(timeout)
+        self.sock.connect(self.path)
+
+# oVirt SDK operations
 
 def find_host(connection):
     """Return the current host object or None."""
@@ -105,34 +426,20 @@ def find_host(connection):
 
     return types.Host(id = host.id)
 
-def open(readonly):
-    # Parse out the username from the output_conn URL.
-    parsed = urlparse(params['output_conn'])
-    username = parsed.username or "admin@internal"
+def create_disk(connection):
+    """
+    Create a new disk for the transfer and wait until the disk is ready.
 
-    # Read the password from file.
-    with builtins.open(params['output_password'], 'r') as fp:
-        password = fp.read()
-    password = password.rstrip()
-
-    # Connect to the server.
-    connection = sdk.Connection(
-        url = params['output_conn'],
-        username = username,
-        password = password,
-        ca_file = params['rhv_cafile'],
-        log = logging.getLogger(),
-        insecure = params['insecure'],
-    )
-
+    Returns disk object.
+    """
     system_service = connection.system_service()
-
-    # Create the disk.
     disks_service = system_service.disks_service()
+
     if params['disk_format'] == "raw":
         disk_format = types.DiskFormat.RAW
     else:
         disk_format = types.DiskFormat.COW
+
     disk = disks_service.add(
         disk = types.Disk(
             # The ID is optional.
@@ -154,25 +461,33 @@ def open(readonly):
         )
     )
 
-    # Wait till the disk is up, as the transfer can't start if the
-    # disk is locked:
-    disk_service = disks_service.disk_service(disk.id)
     debug("disk.id = %r" % disk.id)
 
+    # Wait till the disk moved from LOCKED state to OK state, as the transfer
+    # can't start if the disk is locked.
+
+    disk_service = disks_service.disk_service(disk.id)
     endt = time.time() + timeout
     while True:
-        time.sleep(5)
+        time.sleep(1)
         disk = disk_service.get()
         if disk.status == types.DiskStatus.OK:
             break
         if time.time() > endt:
-            raise RuntimeError("timed out waiting for disk to become unlocked")
+            raise RuntimeError(
+                "timed out waiting for disk %s to become unlocked" % disk.id)
 
-    # Get a reference to the transfer service.
+    return disk
+
+def create_transfer(connection, disk, host):
+    """
+    Create image transfer and wait until the transfer is ready.
+
+    Returns a transfer object.
+    """
+    system_service = connection.system_service()
     transfers_service = system_service.image_transfers_service()
 
-    # Create a new image transfer, using the local host is possible.
-    host = find_host(connection) if params['rhv_direct'] else None
     transfer = transfers_service.add(
         types.ImageTransfer(
             disk = types.Disk(id = disk.id),
@@ -180,6 +495,10 @@ def open(readonly):
             inactivity_timeout = 3600,
         )
     )
+
+    # At this point the transfer owns the disk and will delete the disk if the
+    # transfer is canceled, or if finalizing the transfer fails.
+
     debug("transfer.id = %r" % transfer.id)
 
     # Get a reference to the created transfer service.
@@ -195,84 +514,161 @@ def open(readonly):
             break
         if time.time() > endt:
             transfer_service.cancel()
-            raise RuntimeError("timed out waiting for transfer status "
-                               "!= INITIALIZING")
-        time.sleep(5)
+            raise RuntimeError(
+                "timed out waiting for transfer %s status != INITIALIZING"
+                % transfer.id)
 
-    # Now we have permission to start the transfer.
+        time.sleep(1)
+
+    return transfer
+
+def cancel_transfer(connection, transfer):
+    """
+    Cancel a transfer, removing the transfer disk.
+    """
+    debug("canceling transfer %s" % transfer.id)
+    transfer_service = (connection.system_service()
+                            .image_transfers_service()
+                            .image_transfer_service(transfer.id))
+    transfer_service.cancel()
+
+def finalize_transfer(connection, transfer, disk_id):
+    """
+    Finalize a transfer, making the transfer disk available.
+
+    If finalizing succeeds, transfer's phase will change to FINISHED_SUCCESS
+    and the transer's disk status will change to OK.  On errors, the transfer's
+    phase will change to FINISHED_FAILURE and the disk status will change to
+    ILLEGAL and it will be removed. In both cases the transfer entity will be
+    removed shortly after.
+
+    If oVirt fails to finalize the transfer, transfer's phase will change to
+    PAUSED_SYSTEM. In this case the disk's status will change to ILLEGAL and it
+    will not be removed.
+
+    For simplicity, we track only disk's status changes.
+
+    For more info see:
+    - http://ovirt.github.io/ovirt-engine-api-model/4.4/#services/image_transfer
+    - http://ovirt.github.io/ovirt-engine-sdk/master/types.m.html#ovirtsdk4.types.ImageTransfer
+    """
+    debug("finalizing transfer %s" % transfer.id)
+    transfer_service = (connection.system_service()
+                            .image_transfers_service()
+                            .image_transfer_service(transfer.id))
+
+    start = time.time()
+
+    transfer_service.finalize()
+
+    disk_service = (connection.system_service()
+                        .disks_service()
+                        .disk_service(disk_id))
+
+    while True:
+        time.sleep(1)
+        try:
+            disk = disk_service.get()
+        except sdk.NotFoundError:
+            # Disk verification failed and the system removed the disk.
+            raise RuntimeError(
+                "transfer %s failed: disk %s was removed"
+                % (transfer.id, disk_id))
+
+        if disk.status == types.DiskStatus.ILLEGAL:
+            # Disk verification failed or transfer was paused by the system.
+            raise RuntimeError(
+                "transfer %s failed: disk is ILLEGAL" % transfer.id)
+
+        if disk.status == types.DiskStatus.OK:
+            debug("transfer %s finalized in %.3f seconds"
+                  % (transfer.id, time.time() - start))
+            break
+
+        if time.time() > start + timeout:
+            raise RuntimeError(
+                "timed out waiting for transfer %s to finalize"
+                % transfer.id)
+
+# oVirt imageio operations
+
+def parse_transfer_url(transfer):
+    """
+    Returns a parsed transfer url, preferring direct transfer if possible.
+    """
     if params['rhv_direct']:
         if transfer.transfer_url is None:
-            transfer_service.cancel()
             raise RuntimeError("direct upload to host not supported, "
                                "requires ovirt-engine >= 4.2 and only works "
                                "when virt-v2v is run within the oVirt/RHV "
                                "environment, eg. on an oVirt node.")
-        destination_url = urlparse(transfer.transfer_url)
+        return urlparse(transfer.transfer_url)
     else:
-        destination_url = urlparse(transfer.proxy_url)
+        return urlparse(transfer.proxy_url)
 
-    if destination_url.scheme == "https":
+def create_http(url):
+    """
+    Create http connection for transfer url.
+
+    Returns HTTPConnection.
+    """
+    if url.scheme == "https":
         context = \
             ssl.create_default_context(purpose = ssl.Purpose.SERVER_AUTH,
                                        cafile = params['rhv_cafile'])
         if params['insecure']:
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
-        http = HTTPSConnection(
-            destination_url.hostname,
-            destination_url.port,
-            context = context
-        )
-    elif destination_url.scheme == "http":
-        http = HTTPConnection(
-            destination_url.hostname,
-            destination_url.port,
-        )
+
+        return HTTPSConnection(url.hostname, url.port, context = context)
+    elif url.scheme == "http":
+        return HTTPConnection(url.hostname, url.port)
     else:
-        transfer_service.cancel()
-        raise RuntimeError("unknown URL scheme (%s)" % destination_url.scheme)
+        raise RuntimeError("unknown URL scheme (%s)" % url.scheme)
 
-    # The first request is to fetch the features of the server.
-
-    # Authentication was needed only for GET and PUT requests when
-    # communicating with old imageio-proxy.
-    needs_auth = not params['rhv_direct']
-
-    can_flush = False
-    can_trim = False
-    can_zero = False
-    unix_socket = None
-
-    http.request("OPTIONS", destination_url.path)
+def get_options(http, url):
+    """
+    Send OPTIONS request to imageio server and return options dict.
+    """
+    http.request("OPTIONS", url.path)
     r = http.getresponse()
     data = r.read()
 
     if r.status == 200:
-        # New imageio never needs authentication.
-        needs_auth = False
-
         j = json.loads(data)
-        can_flush = "flush" in j['features']
-        can_trim = "trim" in j['features']
-        can_zero = "zero" in j['features']
-        unix_socket = j.get('unix_socket')
+        features = j["features"]
+        return {
+            # New imageio never used authentication.
+            "needs_auth": False,
+            "can_flush": "flush" in features,
+            "can_trim": "trim" in features,
+            "can_zero": "zero" in features,
+            "unix_socket": j.get('unix_socket'),
+        }
 
-    # Old imageio servers returned either 405 Method Not Allowed or
-    # 204 No Content (with an empty body).  If we see that we leave
-    # all the features as False and they will be emulated.
     elif r.status == 405 or r.status == 204:
-        pass
-
+        # Old imageio servers returned either 405 Method Not Allowed or
+        # 204 No Content (with an empty body).
+        return {
+            # Authentication was required only when using old imageio proxy.
+            # Can be removed when dropping support for oVirt < 4.2.
+            "needs_auth": not params['rhv_direct'],
+            "can_flush": False,
+            "can_trim": False,
+            "can_zero": False,
+            "unix_socket": None,
+        }
     else:
-        transfer_service.cancel()
         raise RuntimeError("could not use OPTIONS request: %d: %s" %
                            (r.status, r.reason))
 
-    debug("imageio features: flush=%r trim=%r zero=%r unix_socket=%r" %
-          (can_flush, can_trim, can_zero, unix_socket))
+def optimize_http(http, host, options):
+    """
+    Return an optimized http connection using unix socket if we are connected
+    to imageio server on the local host and it features a unix socket.
+    """
+    unix_socket = options['unix_socket']
 
-    # If we are connected to imageio on the local host and the
-    # transfer features a unix_socket then we can reconnect to that.
     if host is not None and unix_socket is not None:
         try:
             http = UnixHTTPConnection(unix_socket)
@@ -283,298 +679,4 @@ def open(readonly):
         else:
             debug("optimizing connection using unix socket %r" % unix_socket)
 
-    # Save everything we need to make requests in the handle.
-    return {
-        'can_flush': can_flush,
-        'can_trim': can_trim,
-        'can_zero': can_zero,
-        'connection': connection,
-        'disk': disk,
-        'disk_service': disk_service,
-        'failed': False,
-        'highestwrite': 0,
-        'http': http,
-        'needs_auth': needs_auth,
-        'path': destination_url.path,
-        'transfer': transfer,
-        'transfer_service': transfer_service,
-    }
-
-def can_trim(h):
-    return h['can_trim']
-
-def can_flush(h):
-    return h['can_flush']
-
-def get_size(h):
-    return params['disk_size']
-
-# Any unexpected HTTP response status from the server will end up
-# calling this function which logs the full error, pauses the
-# transfer, sets the failed state, and raises a RuntimeError
-# exception.
-def request_failed(h, r, msg):
-    # Setting the failed flag in the handle causes the disk to be
-    # cleaned up on close.
-    h['failed'] = True
-    h['transfer_service'].pause()
-
-    status = r.status
-    reason = r.reason
-    try:
-        body = r.read()
-    except EnvironmentError as e:
-        body = "(Unable to read response body: %s)" % e
-
-    # Log the full error if we're verbose.
-    debug("unexpected response from imageio server:")
-    debug(msg)
-    debug("%d: %s" % (status, reason))
-    debug(body)
-
-    # Only a short error is included in the exception.
-    raise RuntimeError("%s: %d %s: %r" % (msg, status, reason, body[:200]))
-
-# For documentation see:
-# https://github.com/oVirt/ovirt-imageio/blob/master/docs/random-io.md
-# For examples of working code to read/write from the server, see:
-# https://github.com/oVirt/ovirt-imageio/blob/master/daemon/test/server_test.py
-
-def pread(h, count, offset):
-    http = h['http']
-    transfer = h['transfer']
-
-    headers = {"Range": "bytes=%d-%d" % (offset, offset+count-1)}
-    if h['needs_auth']:
-        headers["Authorization"] = transfer.signed_ticket
-
-    http.request("GET", h['path'], headers=headers)
-
-    r = http.getresponse()
-    # 206 = HTTP Partial Content.
-    if r.status != 206:
-        request_failed(h, r,
-                       "could not read sector offset %d size %d" %
-                       (offset, count))
-
-    return r.read()
-
-def pwrite(h, buf, offset):
-    http = h['http']
-    transfer = h['transfer']
-
-    count = len(buf)
-    h['highestwrite'] = max(h['highestwrite'], offset+count)
-
-    http.putrequest("PUT", h['path'] + "?flush=n")
-    if h['needs_auth']:
-        http.putheader("Authorization", transfer.signed_ticket)
-    # The oVirt server only uses the first part of the range, and the
-    # content-length.
-    http.putheader("Content-Range", "bytes %d-%d/*" % (offset, offset+count-1))
-    http.putheader("Content-Length", str(count))
-    http.endheaders()
-
-    try:
-        http.send(buf)
-    except BrokenPipeError:
-        pass
-
-    r = http.getresponse()
-    if r.status != 200:
-        request_failed(h, r,
-                       "could not write sector offset %d size %d" %
-                       (offset, count))
-
-    r.read()
-
-def zero(h, count, offset, may_trim):
-    http = h['http']
-
-    # Unlike the trim and flush calls, there is no 'can_zero' method
-    # so nbdkit could call this even if the server doesn't support
-    # zeroing.  If this is the case we must emulate.
-    if not h['can_zero']:
-        emulate_zero(h, count, offset)
-        return
-
-    # Construct the JSON request for zeroing.
-    buf = json.dumps({'op': "zero",
-                      'offset': offset,
-                      'size': count,
-                      'flush': False}).encode()
-
-    headers = {"Content-Type": "application/json",
-               "Content-Length": str(len(buf))}
-
-    http.request("PATCH", h['path'], body=buf, headers=headers)
-
-    r = http.getresponse()
-    if r.status != 200:
-        request_failed(h, r,
-                       "could not zero sector offset %d size %d" %
-                       (offset, count))
-
-    r.read()
-
-def emulate_zero(h, count, offset):
-    http = h['http']
-    transfer = h['transfer']
-
-    # qemu-img convert starts by trying to zero/trim the whole device.
-    # Since we've just created a new disk it's safe to ignore these
-    # requests as long as they are smaller than the highest write seen.
-    # After that we must emulate them with writes.
-    if offset+count < h['highestwrite']:
-        http.putrequest("PUT", h['path'])
-        if h['needs_auth']:
-            http.putheader("Authorization", transfer.signed_ticket)
-        http.putheader("Content-Range",
-                       "bytes %d-%d/*" % (offset, offset+count-1))
-        http.putheader("Content-Length", str(count))
-        http.endheaders()
-
-        try:
-            buf = bytearray(128*1024)
-            while count > len(buf):
-                http.send(buf)
-                count -= len(buf)
-            http.send(memoryview(buf)[:count])
-        except BrokenPipeError:
-            pass
-
-        r = http.getresponse()
-        if r.status != 200:
-            request_failed(h, r,
-                           "could not write zeroes offset %d size %d" %
-                           (offset, count))
-
-        r.read()
-
-def trim(h, count, offset):
-    http = h['http']
-
-    # Construct the JSON request for trimming.
-    buf = json.dumps({'op': "trim",
-                      'offset': offset,
-                      'size': count,
-                      'flush': False}).encode()
-
-    headers = {"Content-Type": "application/json",
-               "Content-Length": str(len(buf))}
-
-    http.request("PATCH", h['path'], body=buf, headers=headers)
-
-    r = http.getresponse()
-    if r.status != 200:
-        request_failed(h, r,
-                       "could not trim sector offset %d size %d" %
-                       (offset, count))
-
-    r.read()
-
-def flush(h):
-    http = h['http']
-
-    # Construct the JSON request for flushing.
-    buf = json.dumps({'op': "flush"}).encode()
-
-    headers = {"Content-Type": "application/json",
-               "Content-Length": str(len(buf))}
-
-    http.request("PATCH", h['path'], body=buf, headers=headers)
-
-    r = http.getresponse()
-    if r.status != 200:
-        request_failed(h, r, "could not flush")
-
-    r.read()
-
-def delete_disk_on_failure(h):
-    transfer_service = h['transfer_service']
-    transfer_service.cancel()
-    disk_service = h['disk_service']
-    disk_service.remove()
-
-def close(h):
-    http = h['http']
-    connection = h['connection']
-
-    # This is sometimes necessary because python doesn't set up
-    # sys.stderr to be line buffered and so debug, errors or
-    # exceptions printed previously might not be emitted before the
-    # plugin exits.
-    sys.stderr.flush()
-
-    # If the connection failed earlier ensure we clean up the disk.
-    if h['failed']:
-        delete_disk_on_failure(h)
-        connection.close()
-        return
-
-    try:
-        # Issue a flush request on close so that the data is written to
-        # persistent store before we create the VM.
-        if h['can_flush']:
-            flush(h)
-
-        http.close()
-
-        disk = h['disk']
-        transfer_service = h['transfer_service']
-
-        transfer_service.finalize()
-
-        # Wait until the transfer disk job is completed since
-        # only then we can be sure the disk is unlocked.  As this
-        # code is not very clear, what's happening is that we are
-        # waiting for the transfer object to cease to exist, which
-        # falls through to the exception case and then we can
-        # continue.
-        disk_id = disk.id
-        start = time.time()
-        try:
-            while True:
-                time.sleep(1)
-                disk_service = h['disk_service']
-                disk = disk_service.get()
-                if disk.status == types.DiskStatus.LOCKED:
-                    if time.time() > start + timeout:
-                        raise RuntimeError("timed out waiting for transfer "
-                                           "to finalize")
-                    continue
-                if disk.status == types.DiskStatus.OK:
-                    debug("finalized after %s seconds" % (time.time() - start))
-                    break
-        except sdk.NotFoundError:
-            raise RuntimeError("transfer failed: disk %s not found" % disk_id)
-
-        # Write the disk ID file.  Only do this on successful completion.
-        with builtins.open(params['diskid_file'], 'w') as fp:
-            fp.write(disk.id)
-
-    except:
-        # Otherwise on any failure we must clean up the disk.
-        delete_disk_on_failure(h)
-        raise
-
-    connection.close()
-
-# Modify http.client.HTTPConnection to work over a Unix domain socket.
-# Derived from uhttplib written by Erik van Zijst under an MIT license.
-# (https://pypi.org/project/uhttplib/)
-# Ported to Python 3 by Irit Goihman.
-
-class UnsupportedError(Exception):
-    pass
-
-class UnixHTTPConnection(HTTPConnection):
-    def __init__(self, path, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
-        self.path = path
-        HTTPConnection.__init__(self, "localhost", timeout=timeout)
-
-    def connect(self):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        if self.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
-            self.sock.settimeout(timeout)
-        self.sock.connect(self.path)
+    return http
