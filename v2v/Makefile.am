@@ -18,17 +18,19 @@
 include $(top_srcdir)/subdir-rules.mk
 
 BUILT_SOURCES = \
-	config.ml \
 	output_rhv_upload_createvm_source.ml \
 	output_rhv_upload_deletedisks_source.ml \
 	output_rhv_upload_plugin_source.ml \
 	output_rhv_upload_precheck_source.ml \
-	output_rhv_upload_vmcheck_source.ml \
-	uefi.ml \
-	uefi.mli
+	output_rhv_upload_vmcheck_source.ml
+
+CONFIGURE_GENERATED_ML = \
+	config.ml
 
 EXTRA_DIST = \
-	$(SOURCES_MLI) $(SOURCES_ML) $(SOURCES_C) \
+	$(SOURCES_MLI) \
+	$(filter-out $(CONFIGURE_GENERATED_ML) $(BUILT_SOURCES),$(SOURCES_ML)) \
+	$(SOURCES_C) \
 	copy_to_local.ml \
 	copy_to_local.mli \
 	embed.sh \
@@ -94,8 +96,6 @@ SOURCES_MLI = \
 	qemuopts.mli \
 	target_bus_assignment.mli \
 	types.mli \
-	uefi.mli \
-	utils.mli \
 	v2v.mli \
 	vCenter.mli \
 	var_expander.mli \
@@ -103,9 +103,8 @@ SOURCES_MLI = \
 	windows_virtio.mli
 
 SOURCES_ML = \
-	config.ml \
+	$(CONFIGURE_GENERATED_ML) \
 	types.ml \
-	uefi.ml \
 	utils.ml \
 	var_expander.ml \
 	python_script.ml \
@@ -178,17 +177,6 @@ output_rhv_upload_precheck_source.ml: $(srcdir)/rhv-upload-precheck.py
 output_rhv_upload_vmcheck_source.ml: $(srcdir)/rhv-upload-vmcheck.py
 	$(srcdir)/embed.sh code $^ $@
 
-# These are created by the generator in common/mlv2v and
-# need to be copied here.
-uefi.mli: $(top_srcdir)/common/mlv2v/uefi.mli
-	rm -f $@
-	cp $< $@
-uefi.ml: $(top_srcdir)/common/mlv2v/uefi.ml
-	rm -f $@
-	cp $< $@
-
-if HAVE_OCAML
-
 bin_PROGRAMS = virt-v2v virt-v2v-copy-to-local
 
 virt_v2v_SOURCES = $(SOURCES_C)
@@ -225,7 +213,8 @@ OCAMLPACKAGES = \
 	-I $(top_builddir)/common/mlxml \
 	-I $(top_builddir)/common/mltools \
 	-I $(top_builddir)/common/mllibvirt \
-	-I $(top_builddir)/common/mlcustomize
+	-I $(top_builddir)/common/mlcustomize \
+	-I $(top_builddir)/common/mlv2v
 if HAVE_OCAML_PKG_GETTEXT
 OCAMLPACKAGES += -package gettext-stub
 endif
@@ -255,6 +244,7 @@ OCAMLLINKFLAGS = \
 	mltools.$(MLARCHIVE) \
 	mllibvirt.$(MLARCHIVE) \
 	mlcustomize.$(MLARCHIVE) \
+	mlv2v.$(MLARCHIVE) \
 	$(LINK_CUSTOM_OCAMLC_ONLY)
 
 virt_v2v_DEPENDENCIES = $(OBJECTS) $(top_srcdir)/ocaml-link.sh
@@ -278,7 +268,6 @@ virt_v2v_copy_to_local_CFLAGS = \
 COPY_TO_LOCAL_BOBJECTS = \
 	config.cmo \
 	types.cmo \
-	uefi.cmo \
 	utils.cmo \
 	libvirt_utils.cmo \
 	nbdkit.cmo \
@@ -302,6 +291,7 @@ virt_v2v_copy_to_local_DEPENDENCIES = \
 	../common/mltools/mltools.$(MLARCHIVE) \
 	../common/mllibvirt/mllibvirt.$(MLARCHIVE) \
 	../common/mlcustomize/mlcustomize.$(MLARCHIVE) \
+	../common/mlv2v/mlv2v.$(MLARCHIVE) \
 	$(top_srcdir)/ocaml-link.sh
 virt_v2v_copy_to_local_LINK = \
 	$(top_srcdir)/ocaml-link.sh -cclib '$(OCAMLCLIBS)' -- \
@@ -328,7 +318,6 @@ endif
 v2v_unit_tests_BOBJECTS = \
 	config.cmo \
 	types.cmo \
-	uefi.cmo \
 	utils.cmo \
 	DOM.cmo \
 	create_ovf.cmo \
@@ -376,6 +365,7 @@ v2v_unit_tests_DEPENDENCIES = \
 	../common/mlutils/mlcutils.$(MLARCHIVE) \
 	../common/mltools/mltools.$(MLARCHIVE) \
 	../common/mlcustomize/mlcustomize.$(MLARCHIVE) \
+	../common/mlv2v/mlv2v.$(MLARCHIVE) \
 	$(top_srcdir)/ocaml-link.sh
 v2v_unit_tests_LINK = \
 	$(top_srcdir)/ocaml-link.sh -cclib '$(OCAMLCLIBS)' -- \
@@ -399,9 +389,7 @@ var_expander_tests_LINK = \
 .depend: \
 	$(srcdir)/*.mli \
 	$(srcdir)/*.ml \
-	config.ml \
-	output_rhv_upload_*_source.ml
+	$(CONFIGURE_GENERATED_ML) \
+	$(filter %.ml,$(BUILT_SOURCES))
 	$(top_builddir)/ocaml-dep.sh $^
 -include .depend
-
-endif

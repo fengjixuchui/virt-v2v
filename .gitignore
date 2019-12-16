@@ -40,6 +40,7 @@ Makefile.in
 /config.h
 /config.h.in
 /config.log
+/config.sh
 /config.status
 /config.sub
 /configure
@@ -126,7 +127,6 @@ Makefile.in
 /test-harness/virt-v2v-test-harness.1
 /tests/libvirt-is-version
 /tests/test-v2v-conversion-of-*.sh
-/tests/test-v2v-o-rhv-upload.sh
 /tests/windows.vmdk
 /v2v/.depend
 /v2v/config.ml
@@ -135,8 +135,6 @@ Makefile.in
 /v2v/real-*.d/
 /v2v/real-*.img
 /v2v/real-*.xml
-/v2v/uefi.ml
-/v2v/uefi.mli
 /v2v/v2v_unit_tests
 /v2v/var_expander_tests
 /v2v/virt-v2v
