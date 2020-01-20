@@ -19,9 +19,7 @@
 import json
 import logging
 import sys
-import time
 
-from http.client import HTTPSConnection
 from urllib.parse import urlparse
 
 import ovirtsdk4 as sdk
@@ -50,12 +48,12 @@ username = parsed.username or "admin@internal"
 
 # Connect to the server.
 connection = sdk.Connection(
-    url = params['output_conn'],
-    username = username,
-    password = output_password,
-    ca_file = params['rhv_cafile'],
-    log = logging.getLogger(),
-    insecure = params['insecure'],
+    url=params['output_conn'],
+    username=username,
+    password=output_password,
+    ca_file=params['rhv_cafile'],
+    log=logging.getLogger(),
+    insecure=params['insecure'],
 )
 
 system_service = connection.system_service()
@@ -63,7 +61,7 @@ system_service = connection.system_service()
 # Find if a virtual machine already exists with that name.
 vms_service = system_service.vms_service()
 vms = vms_service.list(
-    search = ("name=%s" % params['output_name']),
+    search=("name=%s" % params['output_name']),
 )
 if len(vms) > 0:
     vm = vms[0]

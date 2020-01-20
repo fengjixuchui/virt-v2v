@@ -41,7 +41,7 @@ SUBDIRS += common/mlxml
 SUBDIRS += common/mltools
 SUBDIRS += common/mlcustomize
 SUBDIRS += common/mlv2v
-SUBDIRS += common/mllibvirt
+SUBDIRS += bundled/libvirt-ocaml
 SUBDIRS += v2v
 SUBDIRS += test-harness
 
@@ -115,6 +115,7 @@ po/POTFILES-ml: configure.ac
 	grep -v '^common/mlprogress/' | \
 	grep -v '^common/mlvisit/' | \
 	grep -v '^v2v/config.ml$$' | \
+	grep -v -E '.*_tests\.ml$$' | \
 	LC_ALL=C sort > $@-t
 	mv $@-t $@
 
@@ -199,6 +200,7 @@ maintainer-check-extra-dist:
 	  grep -v '^common/protocol/' | \
 	  grep -v '^common/structs/' | \
 	  grep -v '^common/visit/' | \
+	  grep -v '^common/windows/' | \
 	  grep -v '^intltool-.*\.in' | \
 	  grep -v '^\.gitmodules' | \
 	  grep -v '^\.gnulib' | \
