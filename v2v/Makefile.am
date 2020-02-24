@@ -73,6 +73,7 @@ SOURCES_MLI = \
 	modules_list.mli \
 	name_from_disk.mli \
 	nbdkit.mli \
+	nbdkit_sources.mli \
 	networks.mli \
 	openstack_image_properties.mli \
 	output_glance.mli \
@@ -113,6 +114,7 @@ SOURCES_ML = \
 	python_script.ml \
 	name_from_disk.ml \
 	nbdkit.ml \
+	nbdkit_sources.ml \
 	vCenter.ml \
 	libosinfo.ml \
 	libosinfo_utils.ml \
@@ -279,6 +281,7 @@ COPY_TO_LOCAL_BOBJECTS = \
 	utils.cmo \
 	libvirt_utils.cmo \
 	nbdkit.cmo \
+	nbdkit_sources.cmo \
 	vCenter.cmo \
 	copy_to_local.cmo
 COPY_TO_LOCAL_XOBJECTS = $(COPY_TO_LOCAL_BOBJECTS:.cmo=.cmx)

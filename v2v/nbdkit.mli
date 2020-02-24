@@ -1,5 +1,5 @@
 (* virt-v2v
- * Copyright (C) 2009-2019 Red Hat Inc.
+ * Copyright (C) 2009-2020 Red Hat Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,66 +16,75 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  *)
 
-(** nbdkit when used as a source. *)
+(** nbdkit as an abstract data type.
 
-type t
+    This "standalone" library can be used to examine nbdkit on
+    the system, probe for plugins and filters, and construct
+    and run nbdkit commands. *)
 
-val create_vddk : ?bandwidth:Types.bandwidth ->
-                  ?config:string ->
-                  ?cookie:string ->
-                  ?libdir:string ->
-                  moref:string ->
-                  ?nfchostport:string ->
-                  ?password_file:string ->
-                  ?port:string ->
-                  server:string ->
-                  ?snapshot:string ->
-                  thumbprint:string ->
-                  ?transports:string ->
-                  ?user:string ->
-                  string -> t
-(** Create a nbdkit object using the VDDK plugin.  The required
-    string parameter is the disk remote path.
+val is_installed : unit -> bool
+(** Return true iff nbdkit is installed and passes some
+    rudimentary tests that it is working.  Note this may
+    return true even if none of the basic plugins are
+    installed. *)
 
-    This can fail (calling [error]) for a variety of reasons, such
-    as nbdkit not being available, wrong version, missing plugin, etc.
+type config = (string * string) list
 
-    Note this doesn't run nbdkit yet, it just creates the object. *)
+val config : unit -> config
+(** Returns the list of tuples from the [nbdkit --dump-config] command. *)
 
-type password =
-| NoPassword
-| AskForPassword
-| PasswordFile of string
+type version = int * int * int
+(** Version of nbdkit: (major, minor, release).  The major
+    will always be [1]. *)
 
-val create_ssh : ?bandwidth:Types.bandwidth ->
-                 password:password ->
-                 ?port:string ->
-                 server:string ->
-                 ?user:string ->
-                 string -> t
-(** Create a nbdkit object using the SSH plugin.  The required
-    string parameter is the remote path.
+val version : config -> version
+(** Get the installed version of nbdkit. *)
 
-    This can fail (calling [error]) for a variety of reasons, such
-    as nbdkit not being available, wrong version, missing plugin, etc.
+val probe_plugin : string -> bool
+(** Probe if a particular plugin is available. *)
 
-    Note this doesn't run nbdkit yet, it just creates the object. *)
+val probe_filter : string -> bool
+(** Probe if a particular filter is available. *)
 
-val create_curl : ?bandwidth:Types.bandwidth ->
-                  ?cookie:string ->
-                  password:password ->
-                  ?sslverify:bool ->
-                  ?user:string ->
-                  string -> t
-(** Create a nbdkit object using the Curl plugin.  The required
-    string parameter is the URL.
+type cmd
+(** An nbdkit command line.  Note this type is immutable. *)
 
-    This can fail (calling [error]) for a variety of reasons, such
-    as nbdkit not being available, wrong version, missing plugin, etc.
+val new_cmd : cmd
+(** Return an empty command line.  {!set_plugin} must be called. *)
 
-    Note this doesn't run nbdkit yet, it just creates the object. *)
+val add_debug_flag : cmd -> string -> string -> cmd
+val set_exportname : cmd -> string -> cmd
+val set_readonly : cmd -> bool -> cmd
+val set_selinux_label : cmd -> string option -> cmd
+val set_verbose : cmd -> bool -> cmd
+(** Set various command line flags. *)
 
-val run : t -> string
-(** Start running nbdkit.
+val set_plugin : cmd -> string -> cmd
+(** Set the plugin name.  Use {!probe_plugin} first to check the
+    plugin is installed. *)
 
-    Returns the QEMU URI that you can use to connect to this instance. *)
+val add_filter : cmd -> string -> cmd
+(** Add a filter.  Use {!probe_filter} first to check the filter
+    is installed.  The filters are added closest to the plugin first. *)
+
+val add_filter_if_available : cmd -> string -> cmd
+(** Same as {!add_filter} but does the {!probe_filter} check and
+    omits the filter if it's not available. *)
+
+val add_arg : cmd -> string -> string -> cmd
+(** Add a key=value argument to the command line.  The arguments are
+    added left to right. *)
+
+val add_env : cmd -> string -> string -> cmd
+(** Add name=value environment variable. *)
+
+val run_unix : cmd -> string * int
+(** Start nbdkit command listening on a Unix domain socket, waiting
+    for the process to start up.
+
+    Returns the temporary Unix domain socket name and the nbdkit
+    process ID.
+
+    The --exit-with-parent, --foreground, --pidfile, --newstyle and
+    --unix flags are added automatically.  Other flags are set as
+    in the {!cmd} struct. *)
