@@ -1,5 +1,5 @@
-# libguestfs
-# Copyright (C) 2009-2019 Red Hat Inc.
+# virt-v2v
+# Copyright (C) 2009-2020 Red Hat Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -69,7 +69,7 @@ gl_EARLY
 gl_INIT
 
 dnl Check for external programs required to either build or run
-dnl libguestfs.
+dnl virt-v2v.
 HEADING([Checking for external programs])
 m4_include([m4/guestfs-progs.m4])
 
@@ -88,10 +88,6 @@ m4_include([m4/guestfs-ocaml.m4])
 dnl Perl, used for running mllibvirt generator, and man pages.
 HEADING([Checking for Perl])
 m4_include([m4/guestfs-perl.m4])
-
-dnl XXX Check for libguestfs OCaml bindings.
-dnl XXX Check for libguestfs Sys::Guestfs (Perl), needed to build
-dnl phony images.
 
 dnl virt-v2v.
 HEADING([Checking the virt-v2v dependencies])
