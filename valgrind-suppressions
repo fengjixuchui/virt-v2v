@@ -171,6 +171,22 @@
    fun:caml_build_primitive_table
 }
 
+# Add for OCaml 4.10.
+{
+   ocaml_heap_leak_7
+   Memcheck:Leak
+   fun:malloc
+   ...
+   fun:caml_init_domain
+}
+{
+   ocaml_heap_leak_8
+   Memcheck:Leak
+   fun:malloc
+   ...
+   fun:caml_init_atom_table
+}
+
 # The OCaml PCRE.compile function calls pcre_compile2 which allocates
 # memory.  If these regexps are stored in a global variable then they
 # can never be freed.  This is not really a bug, so ignore it.
@@ -414,4 +430,13 @@
    Memcheck:Leak
    ...
    fun:Perl_re_op_compile
+}
+
+# libosinfo database reference is deliberately leaked
+# see v2v/libosinfo_utils.ml:get_db
+{
+   libosinfo_leak_1
+   Memcheck:Leak
+   ...
+   fun:v2v_osinfo_db_load
 }
