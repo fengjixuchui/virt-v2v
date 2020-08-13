@@ -23,30 +23,21 @@ MSGID_BUGS_ADDRESS = https://bugzilla.redhat.com/enter_bug.cgi?component=libgues
 
 # Languages.
 # Don't use LINGUAS (uppercase) as Gentoo defines it (RHBZ#804464).
-linguas     := cs de en_GB es eu fr gu hi ja kn ml mr nl or pa pl ru ta te tg uk zh_CN
+linguas     := $(shell cat $(srcdir)/LINGUAS)
 
+POTFILES    := $(shell $(SED) 's,^,$(top_srcdir)/,' $(srcdir)/POTFILES)
 POTFILES_ML := $(shell $(SED) 's,^,$(top_srcdir)/,' $(srcdir)/POTFILES-ml)
 POFILES     := $(linguas:%=%.po)
 GMOFILES    := $(linguas:%=%.gmo)
 
 EXTRA_DIST = \
-	POTFILES-ml \
+	LINGUAS \
+	POTFILES POTFILES-ml \
 	$(DOMAIN).pot \
 	$(POFILES) \
 	$(GMOFILES)
 
 if HAVE_GNU_GETTEXT
-
-dist-hook:
-	$(MAKE) update-po
-	cp *.po *.gmo $(distdir)/
-
-update-po:
-	$(MAKE) $(DOMAIN).pot
-	$(MAKE) $(POFILES)
-	$(MAKE) update-gmo
-
-update-gmo: Makefile $(GMOFILES)
 
 XGETTEXT_ARGS = \
 	--default-domain=$(DOMAIN) \
@@ -69,18 +60,18 @@ XGETTEXT_ARGS = \
 FIX_CHARSET = \
 	$(SED) -i 's|text/plain; charset=CHARSET|text/plain; charset=utf-8|g'
 
-$(DOMAIN).pot: Makefile POTFILES-ml $(POTFILES_ML)
+$(DOMAIN).pot: Makefile POTFILES $(POTFILES) POTFILES-ml $(POTFILES_ML)
 	rm -f $@-t
 	touch $@-t
 if HAVE_OCAML_GETTEXT
-	$(OCAML_GETTEXT) --action extract --extract-pot $@-t $(POTFILES_ML)
+	cd $(top_srcdir) && $(OCAML_GETTEXT) --action extract --extract-pot $(abs_srcdir)/$@-t $(shell cat $(abs_srcdir)/POTFILES-ml)
 	 \
 	$(FIX_CHARSET) $@-t
 endif
+	$(XGETTEXT) -j -o $@-t $(XGETTEXT_ARGS) \
+	  --files-from=$(abs_srcdir)/POTFILES
+	$(FIX_CHARSET) $@-t
 	mv $@-t $@
-
-%.po: $(DOMAIN).pot
-	cd $(srcdir) && $(MSGMERGE) -N --update $@ $(DOMAIN).pot
 
 .po.gmo:
 	rm -f $@ $@-t
@@ -100,10 +91,5 @@ install-data-hook: $(GMOFILES)
 	done
 
 .PRECIOUS: $(DOMAIN).pot $(POFILES)
-
-else
-
-# If no GNU gettext, 'make update-po' is a dummy rule.
-update-po:
 
 endif
