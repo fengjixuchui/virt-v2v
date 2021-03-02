@@ -91,6 +91,8 @@ And hence L<virsh(1)>, L<virt-manager(1)>, and similar tools.
 
 =item OpenSUSE 10 and up
 
+=item ALT Linux 9 and up
+
 =item Debian 6 and up
 
 =item Ubuntu 10.04, 12.04, 14.04, 16.04, and up
@@ -132,7 +134,7 @@ hypervisor, else you will have to adjust paths in the metadata.
 
 =item UEFI on OpenStack
 
-Not supported.
+Supported since virt-v2v E<ge> 1.43.2.
 
 =item UEFI on oVirt or RHV
 

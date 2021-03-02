@@ -21,16 +21,27 @@ import functools
 import inspect
 import json
 import logging
+import queue
 import socket
 import ssl
 import sys
 import time
 
+from contextlib import contextmanager
 from http.client import HTTPSConnection, HTTPConnection
 from urllib.parse import urlparse
 
+import nbdkit
+
 import ovirtsdk4 as sdk
 import ovirtsdk4.types as types
+
+# Using version 2 supporting the buffer protocol for better performance.
+API_VERSION = 2
+
+# Maximum number of connection to imageio server. Based on testing with imageio
+# client, this give best performance.
+MAX_CONNECTIONS = 4
 
 # Timeout to wait for oVirt disks to change status, or the transfer
 # object to finish initializing [seconds].
@@ -56,6 +67,14 @@ def config(key, value):
 def config_complete():
     if params is None:
         raise RuntimeError("missing configuration parameters")
+
+
+def thread_model():
+    """
+    Using parallel model to speed up transfer with multiple connections to
+    imageio server.
+    """
+    return nbdkit.THREAD_MODEL_PARALLEL
 
 
 def debug(s):
@@ -117,38 +136,52 @@ def open(readonly):
         destination_url = parse_transfer_url(transfer)
         http = create_http(destination_url)
         options = get_options(http, destination_url)
-        http = optimize_http(http, host, options)
+
+        # Close the initial connection to imageio server. When qemu-img will
+        # try to access the server, HTTPConnection will reconnect
+        # automatically. If we keep this connection idle and qemu-img is too
+        # slow getting image extents, imageio server may close the connection,
+        # and the import will fail on the first write.
+        # See https://bugzilla.redhat.com/1916176.
+        http.close()
+
+        pool = create_http_pool(destination_url, host, options)
     except:
         cancel_transfer(connection, transfer)
         raise
 
-    debug("imageio features: flush=%(can_flush)r trim=%(can_trim)r "
-          "zero=%(can_zero)r unix_socket=%(unix_socket)r"
+    debug("imageio features: flush=%(can_flush)r "
+          "zero=%(can_zero)r unix_socket=%(unix_socket)r "
+          "max_readers=%(max_readers)r max_writers=%(max_writers)r"
           % options)
 
     # Save everything we need to make requests in the handle.
     return {
         'can_flush': options['can_flush'],
-        'can_trim': options['can_trim'],
         'can_zero': options['can_zero'],
-        'needs_auth': options['needs_auth'],
         'connection': connection,
         'disk_id': disk.id,
         'transfer': transfer,
         'failed': False,
-        'highestwrite': 0,
-        'http': http,
+        'pool': pool,
+        'connections': pool.qsize(),
         'path': destination_url.path,
     }
 
 
 @failing
 def can_trim(h):
-    return h['can_trim']
+    return False
 
 
 @failing
 def can_flush(h):
+    return h['can_flush']
+
+
+@failing
+def can_fua(h):
+    # imageio flush feature is is compatible with NBD_CMD_FLAG_FUA.
     return h['can_flush']
 
 
@@ -184,100 +217,104 @@ def request_failed(r, msg):
 
 
 @failing
-def pread(h, count, offset):
-    http = h['http']
-    transfer = h['transfer']
-
-    headers = {"Range": "bytes=%d-%d" % (offset, offset + count - 1)}
-    if h['needs_auth']:
-        headers["Authorization"] = transfer.signed_ticket
-
-    http.request("GET", h['path'], headers=headers)
-
-    r = http.getresponse()
-    # 206 = HTTP Partial Content.
-    if r.status != 206:
-        request_failed(r,
-                       "could not read sector offset %d size %d" %
-                       (offset, count))
-
-    return r.read()
-
-
-@failing
-def pwrite(h, buf, offset):
-    http = h['http']
-    transfer = h['transfer']
-
+def pread(h, buf, offset, flags):
     count = len(buf)
-    h['highestwrite'] = max(h['highestwrite'], offset + count)
+    headers = {"Range": "bytes=%d-%d" % (offset, offset + count - 1)}
 
-    http.putrequest("PUT", h['path'] + "?flush=n")
-    if h['needs_auth']:
-        http.putheader("Authorization", transfer.signed_ticket)
-    # The oVirt server only uses the first part of the range, and the
-    # content-length.
-    http.putheader("Content-Range", "bytes %d-%d/*" % (offset, offset + count - 1))
-    http.putheader("Content-Length", str(count))
-    http.endheaders()
+    with http_context(h) as http:
+        http.request("GET", h['path'], headers=headers)
 
-    try:
-        http.send(buf)
-    except BrokenPipeError:
-        pass
+        r = http.getresponse()
+        # 206 = HTTP Partial Content.
+        if r.status != 206:
+            request_failed(r,
+                           "could not read sector offset %d size %d" %
+                           (offset, count))
 
-    r = http.getresponse()
-    if r.status != 200:
-        request_failed(r,
-                       "could not write sector offset %d size %d" %
-                       (offset, count))
+        content_length = int(r.getheader("content-length"))
+        if content_length != count:
+            # Should never happen.
+            request_failed(r,
+                           "unexpected Content-Length offset %d size %d got %d" %
+                           (offset, count, content_length))
 
-    r.read()
+        with memoryview(buf) as view:
+            got = 0
+            while got < count:
+                n = r.readinto(view[got:])
+                if n == 0:
+                    request_failed(r,
+                                   "short read offset %d size %d got %d" %
+                                   (offset, count, got))
+                got += n
 
 
 @failing
-def zero(h, count, offset, may_trim):
-    http = h['http']
+def pwrite(h, buf, offset, flags):
+    count = len(buf)
 
+    flush = "y" if (h['can_flush'] and (flags & nbdkit.FLAG_FUA)) else "n"
+
+    with http_context(h) as http:
+        http.putrequest("PUT", h['path'] + "?flush=" + flush)
+        # The oVirt server only uses the first part of the range, and the
+        # content-length.
+        http.putheader("Content-Range", "bytes %d-%d/*" %
+                       (offset, offset + count - 1))
+        http.putheader("Content-Length", str(count))
+        http.endheaders()
+
+        try:
+            http.send(buf)
+        except BrokenPipeError:
+            pass
+
+        r = http.getresponse()
+        if r.status != 200:
+            request_failed(r,
+                           "could not write sector offset %d size %d" %
+                           (offset, count))
+
+        r.read()
+
+
+@failing
+def zero(h, count, offset, flags):
     # Unlike the trim and flush calls, there is no 'can_zero' method
     # so nbdkit could call this even if the server doesn't support
     # zeroing.  If this is the case we must emulate.
     if not h['can_zero']:
-        emulate_zero(h, count, offset)
+        emulate_zero(h, count, offset, flags)
         return
+
+    flush = bool(h['can_flush'] and (flags & nbdkit.FLAG_FUA))
 
     # Construct the JSON request for zeroing.
     buf = json.dumps({'op': "zero",
                       'offset': offset,
                       'size': count,
-                      'flush': False}).encode()
+                      'flush': flush}).encode()
 
     headers = {"Content-Type": "application/json",
                "Content-Length": str(len(buf))}
 
-    http.request("PATCH", h['path'], body=buf, headers=headers)
+    with http_context(h) as http:
+        http.request("PATCH", h['path'], body=buf, headers=headers)
 
-    r = http.getresponse()
-    if r.status != 200:
-        request_failed(r,
-                       "could not zero sector offset %d size %d" %
-                       (offset, count))
+        r = http.getresponse()
+        if r.status != 200:
+            request_failed(r,
+                           "could not zero sector offset %d size %d" %
+                           (offset, count))
 
-    r.read()
+        r.read()
 
 
-def emulate_zero(h, count, offset):
-    http = h['http']
-    transfer = h['transfer']
+def emulate_zero(h, count, offset, flags):
+    flush = "y" if (h['can_flush'] and (flags & nbdkit.FLAG_FUA)) else "n"
 
-    # qemu-img convert starts by trying to zero/trim the whole device.
-    # Since we've just created a new disk it's safe to ignore these
-    # requests as long as they are smaller than the highest write seen.
-    # After that we must emulate them with writes.
-    if offset + count < h['highestwrite']:
-        http.putrequest("PUT", h['path'])
-        if h['needs_auth']:
-            http.putheader("Authorization", transfer.signed_ticket)
+    with http_context(h) as http:
+        http.putrequest("PUT", h['path'] + "?flush=" + flush)
         http.putheader("Content-Range",
                        "bytes %d-%d/*" % (offset, offset + count - 1))
         http.putheader("Content-Length", str(count))
@@ -302,50 +339,27 @@ def emulate_zero(h, count, offset):
 
 
 @failing
-def trim(h, count, offset):
-    http = h['http']
-
-    # Construct the JSON request for trimming.
-    buf = json.dumps({'op': "trim",
-                      'offset': offset,
-                      'size': count,
-                      'flush': False}).encode()
-
-    headers = {"Content-Type": "application/json",
-               "Content-Length": str(len(buf))}
-
-    http.request("PATCH", h['path'], body=buf, headers=headers)
-
-    r = http.getresponse()
-    if r.status != 200:
-        request_failed(r,
-                       "could not trim sector offset %d size %d" %
-                       (offset, count))
-
-    r.read()
-
-
-@failing
-def flush(h):
-    http = h['http']
-
+def flush(h, flags):
     # Construct the JSON request for flushing.
     buf = json.dumps({'op': "flush"}).encode()
 
     headers = {"Content-Type": "application/json",
                "Content-Length": str(len(buf))}
 
-    http.request("PATCH", h['path'], body=buf, headers=headers)
+    # Wait until all inflight requests are completed, and send a flush request
+    # for all imageio connections.
 
-    r = http.getresponse()
-    if r.status != 200:
-        request_failed(r, "could not flush")
+    for http in iter_http_pool(h):
+        http.request("PATCH", h['path'], body=buf, headers=headers)
 
-    r.read()
+        r = http.getresponse()
+        if r.status != 200:
+            request_failed(r, "could not flush")
+
+        r.read()
 
 
 def close(h):
-    http = h['http']
     connection = h['connection']
     transfer = h['transfer']
     disk_id = h['disk_id']
@@ -356,7 +370,7 @@ def close(h):
     # plugin exits.
     sys.stderr.flush()
 
-    http.close()
+    close_http_pool(h)
 
     # If the connection failed earlier ensure we cancel the transfer. Canceling
     # the transfer will delete the disk.
@@ -661,6 +675,84 @@ def transfer_supports_format():
     return "format" in sig.parameters
 
 
+# Connection pool managment
+
+
+def create_http_pool(url, host, options):
+    pool = queue.Queue()
+
+    count = min(options["max_readers"],
+                options["max_writers"],
+                MAX_CONNECTIONS)
+
+    debug("creating http pool connections=%d" % count)
+
+    unix_socket = options["unix_socket"] if host is not None else None
+
+    for i in range(count):
+        http = create_http(url, unix_socket=unix_socket)
+        pool.put(http)
+
+    return pool
+
+
+@contextmanager
+def http_context(h):
+    """
+    Context manager yielding an imageio http connection from the pool. Blocks
+    until a connection is available.
+    """
+    pool = h["pool"]
+    http = pool.get()
+    try:
+        yield http
+    finally:
+        pool.put(http)
+
+
+def iter_http_pool(h):
+    """
+    Wait until all inflight requests are done, and iterate on imageio
+    connections.
+
+    The pool is empty during iteration. New requests issued during iteration
+    will block until iteration is done.
+    """
+    pool = h["pool"]
+    locked = []
+
+    # Lock the pool by taking the connection out.
+    while len(locked) < h["connections"]:
+        locked.append(pool.get())
+
+    try:
+        for http in locked:
+            yield http
+    finally:
+        # Unlock the pool by puting the connection back.
+        for http in locked:
+            pool.put(http)
+
+
+def close_http_pool(h):
+    """
+    Wait until all inflight requests are done, close all connections and remove
+    them from the pool.
+
+    No request can be served by the pool after this call.
+    """
+    debug("closing http pool")
+
+    pool = h["pool"]
+    locked = []
+
+    while len(locked) < h["connections"]:
+        locked.append(pool.get())
+
+    for http in locked:
+        http.close()
+
+
 # oVirt imageio operations
 
 
@@ -679,12 +771,20 @@ def parse_transfer_url(transfer):
         return urlparse(transfer.proxy_url)
 
 
-def create_http(url):
+def create_http(url, unix_socket=None):
     """
     Create http connection for transfer url.
 
     Returns HTTPConnection.
     """
+    if unix_socket:
+        debug("creating unix http connection socket=%r" % unix_socket)
+        try:
+            return UnixHTTPConnection(unix_socket)
+        except Exception as e:
+            # Very unlikely, but we can recover by using https.
+            debug("cannot create unix socket connection: %s" % e)
+
     if url.scheme == "https":
         context = \
             ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH,
@@ -693,8 +793,12 @@ def create_http(url):
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
 
+        debug("creating https connection host=%s port=%s" %
+              (url.hostname, url.port))
         return HTTPSConnection(url.hostname, url.port, context=context)
     elif url.scheme == "http":
+        debug("creating http connection host=%s port=%s" %
+              (url.hostname, url.port))
         return HTTPConnection(url.hostname, url.port)
     else:
         raise RuntimeError("unknown URL scheme (%s)" % url.scheme)
@@ -712,46 +816,23 @@ def get_options(http, url):
         j = json.loads(data)
         features = j["features"]
         return {
-            # New imageio never used authentication.
-            "needs_auth": False,
             "can_flush": "flush" in features,
-            "can_trim": "trim" in features,
             "can_zero": "zero" in features,
             "unix_socket": j.get('unix_socket'),
+            "max_readers": j.get("max_readers", 1),
+            "max_writers": j.get("max_writers", 1),
         }
 
     elif r.status == 405 or r.status == 204:
         # Old imageio servers returned either 405 Method Not Allowed or
         # 204 No Content (with an empty body).
         return {
-            # Authentication was required only when using old imageio proxy.
-            # Can be removed when dropping support for oVirt < 4.2.
-            "needs_auth": not params['rhv_direct'],
             "can_flush": False,
-            "can_trim": False,
             "can_zero": False,
             "unix_socket": None,
+            "max_readers": 1,
+            "max_writers": 1,
         }
     else:
         raise RuntimeError("could not use OPTIONS request: %d: %s" %
                            (r.status, r.reason))
-
-
-def optimize_http(http, host, options):
-    """
-    Return an optimized http connection using unix socket if we are connected
-    to imageio server on the local host and it features a unix socket.
-    """
-    unix_socket = options['unix_socket']
-
-    if host is not None and unix_socket is not None:
-        try:
-            http = UnixHTTPConnection(unix_socket)
-        except Exception as e:
-            # Very unlikely failure, but we can recover by using the https
-            # connection.
-            debug("cannot create unix socket connection, using https: %s" % e)
-        else:
-            debug("optimizing connection using unix socket %r" % unix_socket)
-
-    return http

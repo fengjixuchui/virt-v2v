@@ -462,13 +462,27 @@ let origin_of_source_hypervisor = function
    *)
   | _ -> None
 
-(* Set the <BiosType> element. Other possible values:
- *   1  q35 + SeaBIOS
- *   3  q35 + UEFI + Secure Boot
+(* Set the <BiosType> element.
+ * The internal numbers are:
+ * https://github.com/oVirt/ovirt-engine/blob/master/backend/manager/modules/common/src/main/java/org/ovirt/engine/core/common/businessentities/BiosType.java#L10
+ * BUT the values in <BiosType> are adjusted by adding 1:
+ * https://www.redhat.com/archives/libguestfs/2020-December/msg00005.html
+ * So the actual mapping in the OVF is:
+ * 0 => i440fx + SeaBIOS
+ * 1 => Q35 + SeaBIOS
+ * 2 => Q35 + UEFI
+ * 3 => Q35 + UEFI + SecureBoot
+ * All non-x86 arches should use 0
  *)
-let get_ovirt_biostype = function
-  | TargetBIOS -> 0  (* i440fx + SeaBIOS *)
-  | TargetUEFI -> 2  (* q35 + UEFI *)
+let get_ovirt_biostype arch machine firmware =
+  if arch <> "x86_64" then
+    Some 0
+  else
+    match machine, firmware with
+    | I440FX, TargetBIOS -> Some 0 (* i440fx + SeaBIOS *)
+    | Q35, TargetBIOS -> Some 1    (* q35 + SeaBIOS *)
+    | Q35, TargetUEFI -> Some 2    (* q35 + UEFI *)
+    | _ -> None                    (* who knows!  try cluster default *)
 
 (* Generate the .meta file associated with each volume. *)
 let create_meta_files output_alloc sd_uuid image_uuids overlays =
@@ -523,7 +537,9 @@ let rec create_ovf source targets guestcaps inspect target_firmware
   let vmtype = get_vmtype inspect in
   let vmtype = match vmtype with `Desktop -> "0" | `Server -> "1" in
   let ostype = get_ostype inspect in
-  let biostype = get_ovirt_biostype target_firmware in
+  let biostype =
+    get_ovirt_biostype guestcaps.gcaps_arch guestcaps.gcaps_machine
+                       target_firmware in
 
   let ovf : doc =
     doc "ovf:Envelope" [
@@ -571,8 +587,16 @@ let rec create_ovf source targets guestcaps inspect target_firmware
         e "VmType" [] [PCData vmtype];
         (* See https://bugzilla.redhat.com/show_bug.cgi?id=1260590#c17 *)
         e "DefaultDisplayType" [] [PCData "1"];
-        e "BiosType" [] [PCData (string_of_int biostype)];
       ] in
+
+      (match biostype with
+       | None ->
+          (* omitting <BiosType> means use the cluster default *)
+          ()
+       | Some biostype ->
+          List.push_back content_subnodes
+                         (e "BiosType" [] [PCData (string_of_int biostype)])
+      );
 
       (match source.s_cpu_model with
         | None -> ()
@@ -611,8 +635,6 @@ let rec create_ovf source targets guestcaps inspect target_firmware
         e "Info" [] [PCData (sprintf "%d CPU, %Ld Memory"
                                      source.s_vcpu memsize_mb)]
       ] in
-
-      (* XXX How to set machine type for Q35? *)
 
       List.push_back virtual_hardware_section_items (
         e "Item" [] ([

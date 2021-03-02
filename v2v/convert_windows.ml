@@ -135,56 +135,42 @@ let convert (g : G.guestfs) inspect _ output rcaps static_ips =
   (* Locate and retrieve all the uninstallation commands for installed
    * applications.
    *)
-  let unistallation_commands pretty_name matchfn extra_uninstall_string =
-    let uninsts = ref [] in
+  let uninstallation_commands pretty_name matchfn modfn extra_uninstall_params =
+    let path = ["Microsoft"; "Windows"; "CurrentVersion"; "Uninstall"] in
+    let uninstval = "UninstallString" in
+    let ret = ref [] in
 
-    Registry.with_hive_readonly g inspect.i_windows_software_hive
-      (fun reg ->
-       try
-         let path = ["Microsoft"; "Windows"; "CurrentVersion"; "Uninstall"] in
-         let node =
-           match Registry.get_node reg path with
-           | None -> raise Not_found
-           | Some node -> node in
-         let uninstnodes = g#hivex_node_children node in
-
-         Array.iter (
-           fun { G.hivex_node_h = uninstnode } ->
-             try
+    Registry.with_hive_readonly g inspect.i_windows_software_hive (
+      fun reg ->
+        match Registry.get_node reg path with
+        | None -> ()
+        | Some node ->
+           let uninstnodes = g#hivex_node_children node in
+           Array.iter (
+             fun { G.hivex_node_h = uninstnode } ->
                let valueh = g#hivex_node_get_value uninstnode "DisplayName" in
-               if valueh = 0L then
-                 raise Not_found;
-
-               let dispname = g#hivex_value_string valueh in
-               if not (matchfn dispname) then
-                 raise Not_found;
-
-               let uninstval = "UninstallString" in
-               let valueh = g#hivex_node_get_value uninstnode uninstval in
-               if valueh = 0L then (
-                 let name = g#hivex_node_name uninstnode in
-                 warning (f_"cannot uninstall %s: registry key ‘HKLM\\SOFTWARE\\%s\\%s’ with DisplayName ‘%s’ doesn't contain value ‘%s’")
-                    pretty_name (String.concat "\\" path) name dispname uninstval;
-                 raise Not_found
-               );
-
-               let uninst = (g#hivex_value_string valueh) ^
-                     " /quiet /norestart /l*v+ \"%~dpn0.log\"" ^
-                     " REBOOT=ReallySuppress REMOVE=ALL" in
-               let uninst =
-                 match extra_uninstall_string with
-                 | None -> uninst
-                 | Some s -> uninst ^ " " ^ s in
-
-               List.push_front uninst uninsts
-             with
-               Not_found -> ()
-         ) uninstnodes
-       with
-         Not_found -> ()
-      );
-
-    !uninsts
+               if valueh <> 0L then (
+                 let dispname = g#hivex_value_string valueh in
+                 if matchfn dispname then (
+                   let valueh = g#hivex_node_get_value uninstnode uninstval in
+                   if valueh <> 0L then (
+                     let reg_cmd = g#hivex_value_string valueh in
+                     let reg_cmd = modfn reg_cmd in
+                     let cmd =
+                       sprintf "%s /quiet /norestart /l*v+ \"%%~dpn0.log\" REBOOT=ReallySuppress REMOVE=ALL %s"
+                         reg_cmd extra_uninstall_params in
+                     List.push_front cmd ret
+                   )
+                   else
+                     let name = g#hivex_node_name uninstnode in
+                     warning (f_"cannot uninstall %s: registry key ‘HKLM\\SOFTWARE\\%s\\%s’ with DisplayName ‘%s’ doesn't contain value ‘%s’")
+                       pretty_name (String.concat "\\" path) name
+                       dispname uninstval
+                 )
+               )
+             ) uninstnodes
+    ) (* with_hive_readonly *);
+    !ret
   in
 
   (* Locate and retrieve all uninstallation commands for Parallels Tools. *)
@@ -196,16 +182,24 @@ let convert (g : G.guestfs) inspect _ output rcaps static_ips =
     (* Without these custom Parallels-specific MSI properties the
      * uninstaller still shows a no-way-out reboot dialog.
      *)
-    let extra_uninstall_string =
-      Some "PREVENT_REBOOT=Yes LAUNCHED_BY_SETUP_EXE=Yes" in
-    unistallation_commands "Parallels Tools" matchfn extra_uninstall_string in
+    let extra_uninstall_params =
+      "PREVENT_REBOOT=Yes LAUNCHED_BY_SETUP_EXE=Yes" in
+    uninstallation_commands "Parallels Tools" matchfn identity
+      extra_uninstall_params in
 
   (* Locate and retrieve all uninstallation commands for VMware Tools. *)
   let vmwaretools_uninst =
     let matchfn s =
       String.find s "VMware Tools" != -1
     in
-    unistallation_commands "VMware Tools" matchfn None in
+    (* VMware Tools writes the install command (MsiExec /I) into the
+     * UninstallString key in the registry, rather than the uninstall
+     * command.  Try to spot this and rewrite.  (RHBZ#1917760).
+     *)
+    let re1 = PCRE.compile ~caseless:true "msiexec" in
+    let re2 = PCRE.compile ~caseless:true "/i" in
+    let msifn s = if PCRE.matches re1 s then PCRE.replace re2 "/x" s else s in
+    uninstallation_commands "VMware Tools" matchfn msifn "" in
 
   (*----------------------------------------------------------------------*)
   (* Perform the conversion of the Windows guest. *)
@@ -220,7 +214,8 @@ let convert (g : G.guestfs) inspect _ output rcaps static_ips =
         video_driver,
         virtio_rng_supported,
         virtio_ballon_supported,
-        isa_pvpanic_supported =
+        isa_pvpanic_supported,
+        virtio_socket_supported =
       Registry.with_hive_write g inspect.i_windows_system_hive
                                update_system_hive in
 
@@ -244,10 +239,14 @@ let convert (g : G.guestfs) inspect _ output rcaps static_ips =
         warning (f_"this guest has Anti-Virus (AV) software and a new virtio block device driver was installed.  In some circumstances, AV may prevent new drivers from working (resulting in a 7B boot error).  If this happens, try disabling AV before doing the conversion.");
     );
 
-    (* XXX Look up this information in libosinfo in future. *)
+    (* Pivot on the year 2007.  Any Windows version from earlier than
+     * 2007 should use i440fx, anything 2007 or newer should use q35.
+     * Luckily this coincides almost exactly with the release of NT 6.
+     * XXX Look up this information in libosinfo in future.
+     *)
     let machine =
-      match inspect.i_arch with
-      | "i386"|"x86_64" -> I440FX
+      match inspect.i_arch, inspect.i_major_version with
+      | ("i386"|"x86_64"), major -> if major < 6 then I440FX else Q35
       | _ -> Virt in
 
     (* Return guest capabilities from the convert () function. *)
@@ -258,6 +257,7 @@ let convert (g : G.guestfs) inspect _ output rcaps static_ips =
       gcaps_virtio_rng = virtio_rng_supported;
       gcaps_virtio_balloon = virtio_ballon_supported;
       gcaps_isa_pvpanic = isa_pvpanic_supported;
+      gcaps_virtio_socket = virtio_socket_supported;
       gcaps_machine = machine;
       gcaps_arch = Utils.kvm_arch inspect.i_arch;
       gcaps_acpi = true;
@@ -273,8 +273,8 @@ let convert (g : G.guestfs) inspect _ output rcaps static_ips =
     if Sys.file_exists tool_path then
       configure_wait_pnp tool_path
     else
-      warning (f_"%s is missing.  Firstboot scripts may conflict with PnP.")
-              tool_path;
+      debug (f_"%s is missing.  Firstboot scripts may conflict with PnP.")
+        tool_path;
 
     (* Install RHEV-APT only if appropriate for the output hypervisor. *)
     if output#install_rhev_apt then (
@@ -428,11 +428,12 @@ popd
  and configure_qemu_ga files =
    List.iter (
      fun msi_path ->
+       (* Windows is a trashfire. https://stackoverflow.com/a/18730884 *)
        let fb_script = sprintf "\
 echo Removing any previously scheduled qemu-ga installation
 schtasks.exe /Delete /TN Firstboot-qemu-ga /F
 echo Scheduling delayed installation of qemu-ga from %s
-powershell.exe -command \"$d = (get-date).AddSeconds(120); schtasks.exe /Create /SC ONCE /ST $d.ToString('HH:mm') /SD $d.ToString('MM/dd/yyyy') /RU SYSTEM /TN Firstboot-qemu-ga /TR \\\"C:\\%s /forcerestart /qn /l+*vx C:\\%s.log\\\"\"
+powershell.exe -command \"$d = (get-date).AddSeconds(120); $FormatHack = ($([System.Globalization.DateTimeFormatInfo]::CurrentInfo.ShortDatePattern) -replace 'M+/', 'MM/') -replace 'd+/', 'dd/'; schtasks.exe /Create /SC ONCE /ST $d.ToString('HH:mm') /SD $d.ToString($FormatHack) /RU SYSTEM /TN Firstboot-qemu-ga /TR \\\"C:\\%s /forcerestart /qn /l+*vx C:\\%s.log\\\"\"
       "
       msi_path msi_path msi_path in
       Firstboot.add_firstboot_script g inspect.i_root

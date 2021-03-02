@@ -411,6 +411,7 @@ type guestcaps = {
   gcaps_virtio_rng : bool;
   gcaps_virtio_balloon : bool;
   gcaps_isa_pvpanic : bool;
+  gcaps_virtio_socket : bool;
   gcaps_machine : guestcaps_machine;
   gcaps_arch : string;
   gcaps_acpi : bool;
@@ -536,6 +537,7 @@ class virtual output = object
   method virtual create_metadata : source -> target list -> target_buses -> guestcaps -> inspect -> target_firmware -> unit
   method keep_serial_console = true
   method install_rhev_apt = false
+  method write_out_of_order = false
 end
 
 type output_settings = < keep_serial_console : bool;

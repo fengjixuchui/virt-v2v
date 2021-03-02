@@ -304,6 +304,13 @@ The VDDK library can be operated in a verbose mode where it gives
 (very) verbose messages.  Use ‘virt-v2v -v -x’ as usual to enable
 verbose messages.
 
+=head2 VDDK: Slow imports and repeated NBD_ClientOpen messages
+
+If imports over VDDK are slow, and ‘virt-v2v -v -x’ shows many
+C<NBD_ClientOpen> messages, then you are hitting an apparent bug in
+S<VDDK 6.7> (https://bugzilla.redhat.com/1901489).  Upgrade to at
+least S<VDDK 7> to resolve the issue.
+
 =head1 INPUT FROM VMWARE OVA
 
 Virt-v2v is able to import guests from VMware’s OVA (Open
@@ -581,6 +588,18 @@ server or network configuration so that the vCenter server always gets
 a stable IP address.  After that log in to the vCenter server’s admin
 console at C<https://vcenter:5480/>.  Under the C<Admin> tab, select
 C<Certificate regeneration enabled> and then reboot it.
+
+=head2 vCenter: "Out of HTTP sessions: Limited to ..."
+
+VMware vCenter appears to limit HTTP sessions and in some
+circumstances virt-v2v may exceed this number.  You can adjust or
+remove the limit by editing F</etc/vmware-vpx/vpxd.cfg> on the vCenter
+server.  Increase the C<E<lt>maxSessionCountE<gt>> field, or set it to
+C<0> which makes it unlimited:
+
+ <soap>
+   <maxSessionCount>0</maxSessionCount>
+ </soap>
 
 =head1 SEE ALSO
 

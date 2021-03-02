@@ -84,11 +84,11 @@ let parse_output_options options =
 
   { rhv_cafile; rhv_cluster; rhv_direct; rhv_verifypeer; rhv_disk_uuids }
 
-(* In theory even very old versions of nbdkit might work, but as
- * with [Nbdkit_sources] check for at least 1.12.
+(* We need nbdkit >= 1.22 for API_VERSION 2 and parallel threading model
+ * in the python plugin.
  *)
-let nbdkit_min_version = (1, 12, 0)
-let nbdkit_min_version_string = "1.12.0"
+let nbdkit_min_version = (1, 22, 0)
+let nbdkit_min_version_string = "1.22.0"
 
 let nbdkit_python_plugin = Config.nbdkit_python_plugin
 let pidfile_timeout = 30
@@ -155,25 +155,28 @@ class output_rhv_upload output_alloc output_conn
                         rhv_options =
   (* Create a temporary directory which will be deleted on exit. *)
   let tmpdir =
-    let base_dir = (open_guestfs ())#get_cachedir () in
-    let t = Mkdtemp.temp_dir ~base_dir "rhvupload." in
+    let t = Mkdtemp.temp_dir "rhvupload." in
     rmdir_on_exit t;
     t in
 
   let diskid_file_of_id id = tmpdir // sprintf "diskid.%d" id in
 
   (* Create Python scripts for precheck, vmcheck, plugin and create VM. *)
-  let py_create = Python_script.create ~tmpdir in
-  let precheck_script = py_create ~name:"rhv-upload-precheck.py"
-                        Output_rhv_upload_precheck_source.code in
-  let vmcheck_script = py_create ~name:"rhv-upload-vmcheck.py"
-                       Output_rhv_upload_vmcheck_source.code in
-  let plugin_script = py_create ~name:"rhv-upload-plugin.py"
-                      Output_rhv_upload_plugin_source.code in
-  let createvm_script = py_create ~name:"rhv-upload-createvm.py"
-                        Output_rhv_upload_createvm_source.code in
-  let deletedisks_script = py_create ~name:"rhv-upload-deletedisks.py"
-                           Output_rhv_upload_deletedisks_source.code in
+  let precheck_script =
+    Python_script.create ~name:"rhv-upload-precheck.py"
+      Output_rhv_upload_precheck_source.code in
+  let vmcheck_script =
+    Python_script.create ~name:"rhv-upload-vmcheck.py"
+      Output_rhv_upload_vmcheck_source.code in
+  let plugin_script =
+    Python_script.create ~name:"rhv-upload-plugin.py"
+      Output_rhv_upload_plugin_source.code in
+  let createvm_script =
+    Python_script.create ~name:"rhv-upload-createvm.py"
+      Output_rhv_upload_createvm_source.code in
+  let deletedisks_script =
+    Python_script.create ~name:"rhv-upload-deletedisks.py"
+      Output_rhv_upload_deletedisks_source.code in
 
   (* JSON parameters which are invariant between disks. *)
   let json_params = [
@@ -204,6 +207,9 @@ class output_rhv_upload output_alloc output_conn
   let nbdkit_cmd = Nbdkit.set_verbose nbdkit_cmd (verbose ()) in
   let nbdkit_cmd = Nbdkit.set_plugin nbdkit_cmd nbdkit_python_plugin in
   let nbdkit_cmd = Nbdkit.add_arg nbdkit_cmd "script" (Python_script.path plugin_script) in
+
+  (* Match number of parallel coroutines in qemu-img *)
+  let nbdkit_cmd = Nbdkit.set_threads nbdkit_cmd 8 in
 
   let nbdkit_cmd =
     if have_selinux then
@@ -279,6 +285,8 @@ object
 
   (* rhev-apt.exe will be installed (if available). *)
   method install_rhev_apt = true
+
+  method write_out_of_order = true
 
   method prepare_targets source_name overlays guestcaps =
     let rhv_cluster_name =

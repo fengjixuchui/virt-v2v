@@ -88,6 +88,10 @@ let rec main () =
 
   let g = open_guestfs ~identifier:"v2v" () in
   g#set_memsize (g#get_memsize () * 14 / 5);
+  (* Setting the number of vCPUs allows parallel mkinitrd, but make
+   * sure this is not too large because each vCPU consumes guest RAM.
+   *)
+  g#set_smp (min 8 (Sysconf.nr_processors_online ()));
   (* The network is only used by the unconfigure_vmware () function. *)
   g#set_network true;
   (match conversion_mode with
@@ -264,8 +268,6 @@ and set_source_networks_and_bridges cmdline source =
   let nics = List.map (Networks.map cmdline.network_map) source.s_nics in
   { source with s_nics = nics }
 
-and overlay_dir = (open_guestfs ())#get_cachedir ()
-
 (* Conversion can fail or hang if there is insufficient free space in
  * the temporary directory used to store overlays on the host
  * (RHBZ#1316479).  Although only a few hundred MB is actually
@@ -273,12 +275,12 @@ and overlay_dir = (open_guestfs ())#get_cachedir ()
  * guestfs appliance which is also stored here.
  *)
 and check_host_free_space () =
-  let free_space = StatVFS.free_space (StatVFS.statvfs overlay_dir) in
-  debug "check_host_free_space: overlay_dir=%s free_space=%Ld"
-        overlay_dir free_space;
+  let free_space = StatVFS.free_space (StatVFS.statvfs large_tmpdir) in
+  debug "check_host_free_space: large_tmpdir=%s free_space=%Ld"
+        large_tmpdir free_space;
   if free_space < 1_073_741_824L then
     error (f_"insufficient free space in the conversion server temporary directory %s (%s).\n\nEither free up space in that directory, or set the LIBGUESTFS_CACHEDIR environment variable to point to another directory with more than 1GB of free space.\n\nSee also the virt-v2v(1) manual, section \"Minimum free space check in the host\".")
-          overlay_dir (human_size free_space)
+          large_tmpdir (human_size free_space)
 
 (* Create a qcow2 v3 overlay to protect the source image(s). *)
 and create_overlays source_disks =
@@ -286,7 +288,7 @@ and create_overlays source_disks =
   List.mapi (
     fun i ({ s_qemu_uri = qemu_uri; s_format = format } as source) ->
       let overlay_file =
-        Filename.temp_file ~temp_dir:overlay_dir "v2vovl" ".qcow2" in
+        Filename.temp_file ~temp_dir:large_tmpdir "v2vovl" ".qcow2" in
       unlink_on_exit overlay_file;
 
       (* There is a specific reason to use the newer qcow2 variant:
@@ -683,7 +685,10 @@ and copy_targets cmdline targets input output =
         fun t ->
           match t.target_file with
           | TargetURI _ -> ()
-          | TargetFile s -> try unlink s with _ -> ()
+          | TargetFile filename ->
+             if not (is_block_device filename) then (
+               try unlink filename with _ -> ()
+             )
       ) targets
     )
   );
@@ -713,27 +718,33 @@ and copy_targets cmdline targets input output =
 
       (match t.target_file with
        | TargetFile filename ->
-          (* It turns out that libguestfs's disk creation code is
-           * considerably more flexible and easier to use than
-           * qemu-img, so create the disk explicitly using libguestfs
-           * then pass the 'qemu-img convert -n' option so qemu reuses
-           * the disk.
-           *
-           * Also we allow the output mode to actually create the disk
-           * image.  This lets the output mode set ownership and
-           * permissions correctly if required.
+          (* As a special case, allow output to a block device or
+           * symlink to a block device.  In this case we don't
+           * create/overwrite the block device.  (RHBZ#1868690).
            *)
-          (* What output preallocation mode should we use? *)
-          let preallocation =
-            match t.target_format, cmdline.output_alloc with
-            | ("raw"|"qcow2"), Sparse -> Some "sparse"
-            | ("raw"|"qcow2"), Preallocated -> Some "full"
-            | _ -> None (* ignore -oa flag for other formats *) in
-          let compat =
-            match t.target_format with "qcow2" -> Some "1.1" | _ -> None in
-          output#disk_create filename t.target_format
-                             t.target_overlay.ov_virtual_size
-                             ?preallocation ?compat
+          if not (is_block_device filename) then (
+            (* It turns out that libguestfs's disk creation code is
+             * considerably more flexible and easier to use than
+             * qemu-img, so create the disk explicitly using libguestfs
+             * then pass the 'qemu-img convert -n' option so qemu reuses
+             * the disk.
+             *
+             * Also we allow the output mode to actually create the disk
+             * image.  This lets the output mode set ownership and
+             * permissions correctly if required.
+             *)
+            (* What output preallocation mode should we use? *)
+            let preallocation =
+              match t.target_format, cmdline.output_alloc with
+              | ("raw"|"qcow2"), Sparse -> Some "sparse"
+              | ("raw"|"qcow2"), Preallocated -> Some "full"
+              | _ -> None (* ignore -oa flag for other formats *) in
+            let compat =
+              match t.target_format with "qcow2" -> Some "1.1" | _ -> None in
+            output#disk_create filename t.target_format
+                               t.target_overlay.ov_virtual_size
+                               ?preallocation ?compat
+          )
 
        | TargetURI _ ->
           (* XXX For the moment we assume that qemu URI outputs
@@ -752,6 +763,7 @@ and copy_targets cmdline targets input output =
         [ "-n"; "-f"; "qcow2"; "-O"; output#transfer_format t ] @
         (if cmdline.compressed then [ "-c" ] else []) @
         [ "-S"; "64k" ] @
+        (if output#write_out_of_order then [ "-W" ] else []) @
         [ overlay_file; filename ] in
       let start_time = gettimeofday () in
       if run_command cmd <> 0 then
@@ -823,7 +835,7 @@ and preserve_overlays overlays src_name =
   List.iter (
     fun ov ->
       let saved_filename =
-        sprintf "%s/%s-%s.qcow2" overlay_dir src_name ov.ov_sd in
+        sprintf "%s/%s-%s.qcow2" large_tmpdir src_name ov.ov_sd in
       rename ov.ov_overlay_file saved_filename;
       info (f_"Overlay saved as %s [--debug-overlays]") saved_filename
   ) overlays

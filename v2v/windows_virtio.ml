@@ -68,7 +68,7 @@ let rec install_drivers ((g, _) as reg) inspect rcaps =
         match net_type with
         | Some model -> model
         | None -> RTL8139 in
-      (IDE, net_type, Cirrus, false, false, false)
+      (IDE, net_type, Cirrus, false, false, false, false)
   )
   else (
     (* Can we install the block driver? *)
@@ -178,9 +178,10 @@ let rec install_drivers ((g, _) as reg) inspect rcaps =
     let virtio_rng_supported = g#exists (driverdir // "viorng.inf") in
     let virtio_ballon_supported = g#exists (driverdir // "balloon.inf") in
     let isa_pvpanic_supported = g#exists (driverdir // "pvpanic.inf") in
+    let virtio_socket_supported = g#exists (driverdir // "viosock.inf") in
 
     (block, net, video,
-     virtio_rng_supported, virtio_ballon_supported, isa_pvpanic_supported)
+     virtio_rng_supported, virtio_ballon_supported, isa_pvpanic_supported, virtio_socket_supported)
   )
 
 and install_linux_tools g inspect =
@@ -474,10 +475,17 @@ and virtio_iso_path_matches_qemu_ga path inspect =
  * Returns list of copied files.
  *)
 and copy_from_libosinfo g inspect destdir =
+  let debug_drivers =
+    List.iter (
+      fun d ->
+        debug "\t%s" (Libosinfo_utils.string_of_osinfo_device_driver d)
+    )
+  in
   let { i_osinfo = osinfo; i_arch = arch } = inspect in
   try
     let os = Libosinfo_utils.get_os_by_short_id osinfo in
     let drivers = os#get_device_drivers () in
+    debug "libosinfo drivers before filtering:"; debug_drivers drivers;
     (*
      * Filter out drivers that we cannot use:
      * - for a different architecture
@@ -498,6 +506,7 @@ and copy_from_libosinfo g inspect destdir =
               )
             with Invalid_argument _ -> false
       ) drivers in
+    debug "libosinfo drivers after filtering:"; debug_drivers drivers;
     (* Sort the drivers by priority, like libosinfo does. *)
     let drivers =
       List.sort (
