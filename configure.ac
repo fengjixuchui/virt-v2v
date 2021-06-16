@@ -19,8 +19,8 @@
 # add extra information using --with-extra="..." which may be any
 # freeform string.
 m4_define([v2v_major],   [1])
-m4_define([v2v_minor],   [43])
-m4_define([v2v_release], [3])
+m4_define([v2v_minor],   [45])
+m4_define([v2v_release], [1])
 
 AC_INIT([virt-v2v],v2v_major.v2v_minor.v2v_release)
 
@@ -75,11 +75,6 @@ AC_DEFINE_UNQUOTED([PACKAGE_VERSION_EXTRA],["$v2v_extra"],[Extra version string.
 PACKAGE_VERSION_FULL="v2v_major.v2v_minor.v2v_release${v2v_extra}"
 AC_DEFINE_UNQUOTED([PACKAGE_VERSION_FULL],["$PACKAGE_VERSION_FULL"],[Full version string.])
 AC_SUBST([PACKAGE_VERSION_FULL])
-
-dnl Early gnulib initialization.
-HEADING([Configuring Gnulib])
-gl_EARLY
-gl_INIT
 
 dnl Check for external programs required to either build or run
 dnl virt-v2v.
@@ -149,7 +144,6 @@ AC_CONFIG_FILES([Makefile
                  config.sh
                  docs/Makefile
                  gnulib/lib/Makefile
-                 gnulib/tests/Makefile
                  po-docs/Makefile
                  po-docs/ja/Makefile
                  po-docs/uk/Makefile
@@ -162,8 +156,6 @@ AC_CONFIG_FILES([Makefile
                  test-data/files/Makefile
                  test-data/phony-guests/Makefile
                  test-data/phony-guests/guests.xml
-                 test-harness/Makefile
-                 test-harness/META
                  tests/Makefile
                  tests/rhbz1232192.xml
                  tests/test-v2v-cdrom.xml

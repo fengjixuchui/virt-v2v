@@ -31,8 +31,6 @@ EXTRA_DIST = \
 	$(SOURCES_MLI) \
 	$(filter-out $(CONFIGURE_GENERATED_ML) $(BUILT_SOURCES),$(SOURCES_ML)) \
 	$(SOURCES_C) \
-	copy_to_local.ml \
-	copy_to_local.mli \
 	embed.sh \
 	rhv-upload-createvm.py \
 	rhv-upload-deletedisks.py \
@@ -185,7 +183,7 @@ output_rhv_upload_precheck_source.ml: $(srcdir)/rhv-upload-precheck.py
 output_rhv_upload_vmcheck_source.ml: $(srcdir)/rhv-upload-vmcheck.py
 	$(srcdir)/embed.sh code $^ $@
 
-bin_PROGRAMS = virt-v2v virt-v2v-copy-to-local
+bin_PROGRAMS = virt-v2v
 
 virt_v2v_SOURCES = $(SOURCES_C)
 virt_v2v_CPPFLAGS = \
@@ -196,6 +194,7 @@ virt_v2v_CPPFLAGS = \
 	-I$(top_srcdir)/common/qemuopts \
 	-I$(top_srcdir)/lib
 virt_v2v_CFLAGS = \
+	-pthread \
 	$(WARN_CFLAGS) $(WERROR_CFLAGS) \
 	$(LIBGUESTFS_CFLAGS) \
 	$(LIBVIRT_CFLAGS) \
@@ -230,6 +229,7 @@ OCAMLPACKAGES += -package gettext-stub
 endif
 
 OCAMLCLIBS = \
+	-pthread \
 	-lqemuopts \
 	$(LIBGUESTFS_LIBS) \
 	$(LIBVIRT_LIBS) \
@@ -264,52 +264,6 @@ virt_v2v_LINK = \
 	$(top_srcdir)/ocaml-link.sh -cclib '$(OCAMLCLIBS)' -- \
 	  $(OCAMLFIND) $(BEST) $(OCAMLFLAGS) $(OCAMLPACKAGES) $(OCAMLLINKFLAGS) \
 	  $(OBJECTS) -o $@
-
-virt_v2v_copy_to_local_SOURCES = \
-	dummy.c
-virt_v2v_copy_to_local_CPPFLAGS = \
-	-DCAML_NAME_SPACE \
-	-I. \
-	-I$(top_builddir) \
-	-I$(shell $(OCAMLC) -where) \
-	-I$(top_srcdir)/lib
-virt_v2v_copy_to_local_CFLAGS = \
-	$(WARN_CFLAGS) $(WERROR_CFLAGS) \
-	$(LIBVIRT_CFLAGS)
-
-COPY_TO_LOCAL_BOBJECTS = \
-	config.cmo \
-	types.cmo \
-	utils.cmo \
-	libvirt_utils.cmo \
-	nbdkit.cmo \
-	nbdkit_sources.cmo \
-	vCenter.cmo \
-	copy_to_local.cmo
-COPY_TO_LOCAL_XOBJECTS = $(COPY_TO_LOCAL_BOBJECTS:.cmo=.cmx)
-
-if !HAVE_OCAMLOPT
-COPY_TO_LOCAL_OBJECTS = $(COPY_TO_LOCAL_BOBJECTS)
-else
-COPY_TO_LOCAL_OBJECTS = $(COPY_TO_LOCAL_XOBJECTS)
-endif
-
-virt_v2v_copy_to_local_DEPENDENCIES = \
-	$(COPY_TO_LOCAL_OBJECTS) \
-	../common/mlstdutils/mlstdutils.$(MLARCHIVE) \
-	../common/mlxml/mlxml.$(MLARCHIVE) \
-	../common/mlgettext/mlgettext.$(MLARCHIVE) \
-	../common/mlpcre/mlpcre.$(MLARCHIVE) \
-	../common/mlutils/mlcutils.$(MLARCHIVE) \
-	../common/mltools/mltools.$(MLARCHIVE) \
-	../bundled/libvirt-ocaml/mllibvirt.$(MLARCHIVE) \
-	../common/mlcustomize/mlcustomize.$(MLARCHIVE) \
-	../common/mlv2v/mlv2v.$(MLARCHIVE) \
-	$(top_srcdir)/ocaml-link.sh
-virt_v2v_copy_to_local_LINK = \
-	$(top_srcdir)/ocaml-link.sh -cclib '$(OCAMLCLIBS)' -- \
-	  $(OCAMLFIND) $(BEST) $(OCAMLFLAGS) $(OCAMLPACKAGES) $(OCAMLLINKFLAGS) \
-	  $(COPY_TO_LOCAL_OBJECTS) -o $@
 
 # Data directory.
 
@@ -359,16 +313,16 @@ var_expander_tests_CFLAGS = $(virt_v2v_CFLAGS)
 if !HAVE_OCAMLOPT
 # Can't call this v2v_unit_tests_OBJECTS because automake gets confused.
 v2v_unit_tests_THEOBJECTS = $(v2v_unit_tests_BOBJECTS)
-v2v_unit_tests.cmo: OCAMLPACKAGES += -package oUnit
+v2v_unit_tests.cmo: OCAMLPACKAGES += -package ounit2
 
 var_expander_tests_THEOBJECTS = $(var_expander_tests_BOBJECTS)
-var_expander_tests.cmo: OCAMLPACKAGES += -package oUnit
+var_expander_tests.cmo: OCAMLPACKAGES += -package ounit2
 else
 v2v_unit_tests_THEOBJECTS = $(v2v_unit_tests_XOBJECTS)
-v2v_unit_tests.cmx: OCAMLPACKAGES += -package oUnit
+v2v_unit_tests.cmx: OCAMLPACKAGES += -package ounit2
 
 var_expander_tests_THEOBJECTS = $(var_expander_tests_XOBJECTS)
-var_expander_tests.cmx: OCAMLPACKAGES += -package oUnit
+var_expander_tests.cmx: OCAMLPACKAGES += -package ounit2
 endif
 
 v2v_unit_tests_DEPENDENCIES = \
@@ -385,7 +339,7 @@ v2v_unit_tests_DEPENDENCIES = \
 v2v_unit_tests_LINK = \
 	$(top_srcdir)/ocaml-link.sh -cclib '$(OCAMLCLIBS)' -- \
 	  $(OCAMLFIND) $(BEST) $(OCAMLFLAGS) \
-	  $(OCAMLPACKAGES) -package oUnit \
+	  $(OCAMLPACKAGES) -package ounit2 \
 	  $(OCAMLLINKFLAGS) \
 	  $(v2v_unit_tests_THEOBJECTS) -o $@
 
@@ -396,7 +350,7 @@ var_expander_tests_DEPENDENCIES = \
 var_expander_tests_LINK = \
 	$(top_srcdir)/ocaml-link.sh -cclib '$(OCAMLCLIBS)' -- \
 	  $(OCAMLFIND) $(BEST) $(OCAMLFLAGS) \
-	  $(OCAMLPACKAGES) -package oUnit \
+	  $(OCAMLPACKAGES) -package ounit2 \
 	  $(OCAMLLINKFLAGS) \
 	  $(var_expander_tests_THEOBJECTS) -o $@
 

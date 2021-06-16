@@ -1,6 +1,5 @@
-#!/bin/bash -
-# libguestfs virt-v2v test script
-# Copyright (C) 2015 Red Hat Inc.
+# libguestfs
+# Copyright (C) 2017-2021 Red Hat Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -16,28 +15,27 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-# Test virt-v2v-copy-to-local command.
+# This directory contains some dependencies originally from gnulib.
+# The aim is for everything in this directory to eventually go away,
+# probably being moved to common/utils.
 
-set -e
+include $(top_srcdir)/subdir-rules.mk
 
-$TEST_FUNCTIONS
-skip_if_skipped
-skip_unless_phony_guest fedora.img
-
-libvirt_uri="test://$abs_top_builddir/test-data/phony-guests/guests.xml"
-
-d=test-v2v-copy-to-local.d
-rm -rf $d
-mkdir $d
-
-pushd $d
-$VG virt-v2v-copy-to-local --debug-gc -ic "$libvirt_uri" fedora
-popd
-
-# Test the libvirt XML metadata was created.
-test -f $d/fedora.xml
-
-# Test the disk was created.
-test -f $d/fedora-disk1
-
-rm -r $d
+noinst_LTLIBRARIES = libgnu.la
+libgnu_la_SOURCES = \
+	bitrotate.h \
+	c-ctype.h \
+	getprogname.h \
+	hash.c \
+	hash.h \
+	ignore-value.h \
+	xalloc-oversized.h \
+	xstrtol.c \
+	xstrtol.h \
+	xstrtoll.c \
+	xstrtoul.c \
+	xstrtoull.c \
+	xstrtoumax.c
+libutils_la_CFLAGS = \
+	$(WARN_CFLAGS) $(WERROR_CFLAGS) \
+	$(GCC_VISIBILITY_HIDDEN)

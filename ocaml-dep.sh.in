@@ -33,7 +33,6 @@ set -e
 # directories must have unique names (eg. not ‘Utils’) else
 # dependencies don't get built right.
 include_dirs="
-common/mlaugeas
 common/mlgettext
 common/mlpcre
 common/mlprogress
@@ -43,8 +42,6 @@ common/mlutils
 common/mlv2v
 common/mlvisit
 common/mlxml
-customize
-ocaml
 "
 
 # Output file is always created in the current directory.

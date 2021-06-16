@@ -39,21 +39,18 @@ AC_PROG_AWK
 
 AC_PROG_LN_S
 
-dnl Check for genisoimage/mkisofs
-AC_PATH_PROGS([GENISOIMAGE],[genisoimage mkisofs],[no],
+dnl Check for xorriso/genisoimage/mkisofs.
+AC_PATH_PROGS([MKISOFS],[xorrisofs genisoimage mkisofs],[no],
     [$PATH$PATH_SEPARATOR/usr/sbin$PATH_SEPARATOR/sbin])
-test "x$GENISOIMAGE" = "xno" && AC_MSG_ERROR([genisoimage must be installed])
+test "x$MKISOFS" = "xno" && AC_MSG_ERROR([xorriso or genisoimage or mkisofs must be installed])
 
 dnl po4a for translating man pages and POD files (optional).
 AC_CHECK_PROG([PO4A_GETTEXTIZE],[po4a-gettextize],[po4a-gettextize],[no])
 AC_CHECK_PROG([PO4A_TRANSLATE],[po4a-translate],[po4a-translate],[no])
 AM_CONDITIONAL([HAVE_PO4A], [test "x$PO4A_GETTEXTIZE" != "xno" && test "x$PO4A_TRANSLATE" != "xno"])
 
-dnl Check for db_load (optional).
-GUESTFS_FIND_DB_TOOL([DB_LOAD], [load])
-if test "x$DB_LOAD" != "xno"; then
-    AC_DEFINE_UNQUOTED([DB_LOAD],["$DB_LOAD"],[Name of db_load program.])
-fi
+dnl Check for sqlite3 (optional).
+AC_CHECK_PROG([SQLITE3],[sqlite3],[sqlite3],[no])
 
 dnl zip/unzip, used by virt-v2v
 AC_PATH_PROGS([ZIP],[zip],[no])

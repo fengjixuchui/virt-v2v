@@ -25,11 +25,7 @@ SUBDIRS = common/mlstdutils
 # tests run, except tests/qemu.
 SUBDIRS += test-data
 
-# Gnulib - must be built and tested before the program.
 SUBDIRS += gnulib/lib
-if ENABLE_GNULIB_TESTS
-SUBDIRS += gnulib/tests
-endif
 
 SUBDIRS += common/qemuopts
 SUBDIRS += common/utils
@@ -43,7 +39,6 @@ SUBDIRS += common/mlcustomize
 SUBDIRS += common/mlv2v
 SUBDIRS += bundled/libvirt-ocaml
 SUBDIRS += v2v
-SUBDIRS += test-harness
 
 SUBDIRS += tests
 
@@ -64,8 +59,6 @@ endif
 # lib/guestfs-internal-all.h is a hack, remove it XXX
 EXTRA_DIST = \
 	.gitignore \
-	autogen.sh \
-	bootstrap \
 	bugs-in-changelog.sh \
 	build-aux/config.rpath \
 	cfg.mk \
@@ -74,7 +67,6 @@ EXTRA_DIST = \
 	common/README \
 	COPYING \
 	lib/guestfs-internal-all.h \
-	m4/.gitignore \
 	ocaml-link.sh \
 	podcheck.pl \
 	tmp/.gitignore \
@@ -97,24 +89,17 @@ EXTRA_DIST = \
 
 # When doing 'make dist' update a few files automatically.
 #
-#  ChangeLog      - changelog (created from git)
 #  po/POTFILES    - files with ordinary extensions, but not OCaml files
 #  po/POTFILES-ml - OCaml files, which need a special tool to translate
 
-dist-hook: ChangeLog po/POTFILES po/POTFILES-ml
-	cp ChangeLog $(distdir)/ChangeLog
-
-ChangeLog: configure.ac
-	rm -f $@ $@-t
-	git log --decorate=false > $@-t
-	mv $@-t $@
+dist-hook: po/POTFILES po/POTFILES-ml
 
 # For more information about translations, see po/Makefile.am.
 po/POTFILES: configure.ac
 	rm -f $@ $@-t
 	cd $(srcdir); \
 	find $(DIST_SUBDIRS) -name '*.c' | \
-	grep -v -E '^(gnulib|po-docs|tests|test-data|bundled)/' | \
+	grep -v -E '^(po-docs|tests|test-data|bundled)/' | \
 	grep -v -E '/(dummy\.c)$$' | \
 	grep -v -E '.*-(tests)\.c$$' | \
 	LC_ALL=C sort -u > $@-t
@@ -215,7 +200,6 @@ maintainer-check-extra-dist:
 	  grep -v '^common/windows/' | \
 	  grep -v '^intltool-.*\.in' | \
 	  grep -v '^\.gitmodules' | \
-	  grep -v '^\.gnulib' | \
 	  sort > tmp/gitfiles
 	comm -13 tmp/tarfiles tmp/gitfiles > tmp/comm-out
 	@echo Checking for differences between EXTRA_DIST and git ...
